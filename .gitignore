@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# 日志和运行时状态
+*.log
+*.pid
+*.lock
+*.sock
+
+# 模型缓存
+*.pt
+*.bin
+*.onnx
+*.safetensors
+
+# 配置（含密钥，用模板替代）
+llm.env
+
+# 测试临时文件
+test_ibus_commit.py
+last_failed_inject.txt
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db

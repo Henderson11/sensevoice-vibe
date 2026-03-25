@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<component>
+	<name>im.sensevoice.SenseVoice</name>
+	<description>SenseVoice Voice Input Engine</description>
+	<exec>/usr/bin/python3 /home/dell/mosim_workspace/work/sensevoice-local-small/ibus-sensevoice/sensevoice_engine.py --ibus</exec>
+	<version>0.1</version>
+	<author>sensevoice</author>
+	<license>MIT</license>
+	<homepage></homepage>
+	<textdomain></textdomain>
+	<engines>
+		<engine>
+			<name>sensevoice-voice</name>
+			<language>zh</language>
+			<license>MIT</license>
+			<author>sensevoice</author>
+			<icon></icon>
+			<layout>default</layout>
+			<longname>SenseVoice Voice</longname>
+			<description>Voice input via SenseVoice ASR</description>
+			<rank>0</rank>
+		</engine>
+	</engines>
+</component>
