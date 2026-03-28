@@ -94,6 +94,7 @@ start_daemon() {
   notify_msg "ASR daemon starting..."
   log_toggle "START_DAEMON_REQUEST"
   nohup env \
+    PYTHONPATH="$ROOT_DIR" \
     SENSEVOICE_RESIDENT=1 \
     SENSEVOICE_STREAM_ACTIVE_ON_START=1 \
     SENSEVOICE_MODEL="${SENSEVOICE_MODEL:-$MODEL_PATH_DEFAULT}" \

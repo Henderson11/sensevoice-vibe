@@ -10,6 +10,7 @@ Type=simple
 WorkingDirectory=__INSTALL_DIR__
 # 所有配置从 llm.env 读取（单一配置源）
 EnvironmentFile=-%h/.config/sensevoice-vibe/llm.env
+Environment=PYTHONPATH=__INSTALL_DIR__
 Environment=SENSEVOICE_RESIDENT=1
 Environment=SENSEVOICE_STREAM_ACTIVE_ON_START=1
 Environment=SENSEVOICE_STATE_LOG=%h/.local/state/sensevoice-vibe/stream_vad.log
