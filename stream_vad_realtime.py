@@ -2512,7 +2512,7 @@ def parse_args() -> argparse.Namespace:
 def load_model(args: argparse.Namespace) -> AutoModel:
     return AutoModel(
         model=args.model,
-        trust_remote_code=True,
+        trust_remote_code=False,
         device=args.device,
         disable_update=True,
         disable_log=True,
