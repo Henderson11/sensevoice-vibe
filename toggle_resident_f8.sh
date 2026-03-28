@@ -16,7 +16,7 @@ STATUS_WAIT_SEC="${SENSEVOICE_TOGGLE_STATUS_WAIT_SEC:-3}"
 TOGGLE_DEBOUNCE_MS="${SENSEVOICE_TOGGLE_DEBOUNCE_MS:-450}"
 LAST_TOGGLE_MS_FILE="$STATE_DIR/last_toggle_ms"
 
-MODEL_PATH_DEFAULT="$HOME/.cache/modelscope/hub/models/iic/SenseVoiceSmall"
+MODEL_PATH_DEFAULT="$ROOT_DIR/models/sensevoice-small"
 
 log_toggle() {
   printf '%s %s\n' "$(date '+%F %T')" "$*" >>"$TOGGLE_LOG"

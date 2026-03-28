@@ -10,11 +10,8 @@ __pycache__/
 *.lock
 *.sock
 
-# 模型缓存
-*.pt
-*.bin
-*.onnx
-*.safetensors
+# 模型文件由 Git LFS 管理，不在 .gitignore 中排除
+# *.pt *.ckpt 等已通过 .gitattributes 配置 LFS 跟踪
 
 # 配置（含密钥，用模板替代）
 llm.env
