@@ -757,257 +757,6 @@ class ConfidenceRouter:
         return "mid"
 
 
-class CorrectionMemory:
-    _LOW_VALUE_CN_CHARS = set("的地得了着过吗么呢啊呀吧嘛将把被与和及并在是有就也都又还才")
-
-    def __init__(self, enabled: bool, store_path: str, min_hits: int, max_rules: int):
-        self.requested = bool(enabled)
-        self.enabled = False
-        self.reason = "disabled"
-        self.store_path = os.path.expanduser((store_path or "").strip())
-        self.min_hits = max(1, int(min_hits))
-        self.max_rules = max(20, int(max_rules))
-        self._exact: Dict[str, Dict[str, object]] = {}
-        self._rules: Dict[str, Dict[str, object]] = {}
-        self._dirty = False
-        self._last_save_ts = 0.0
-
-        if not self.requested:
-            return
-        if not self.store_path:
-            self.reason = "path_missing"
-            return
-        os.makedirs(os.path.dirname(self.store_path), exist_ok=True)
-        self._load()
-        self._sanitize_loaded_entries()
-        self.enabled = True
-        self.reason = f"ready:exact={len(self._exact)},rules={len(self._rules)}"
-
-    def _load(self) -> None:
-        if not os.path.isfile(self.store_path):
-            return
-        try:
-            with open(self.store_path, "r", encoding="utf-8") as f:
-                obj = json.load(f)
-            exact = obj.get("exact", {})
-            rules = obj.get("rules", {})
-            if isinstance(exact, dict):
-                for k, v in exact.items():
-                    if not isinstance(k, str) or not isinstance(v, dict):
-                        continue
-                    dst = str(v.get("dst", "")).strip()
-                    hits = int(v.get("hits", 0))
-                    if k.strip() and dst and hits > 0:
-                        self._exact[k] = {"dst": dst, "hits": hits, "ts": float(v.get("ts", 0))}
-            if isinstance(rules, dict):
-                for k, v in rules.items():
-                    if not isinstance(k, str) or not isinstance(v, dict):
-                        continue
-                    dst = str(v.get("dst", "")).strip()
-                    hits = int(v.get("hits", 0))
-                    if k.strip() and dst and hits > 0:
-                        self._rules[k] = {"dst": dst, "hits": hits, "ts": float(v.get("ts", 0))}
-        except Exception:
-            self._exact = {}
-            self._rules = {}
-
-    def _save(self, force: bool = False) -> None:
-        if not self._dirty:
-            return
-        now = time.time()
-        if not force and now - self._last_save_ts < 2.0:
-            return
-        payload = {"exact": self._exact, "rules": self._rules}
-        tmp = f"{self.store_path}.tmp"
-        try:
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(payload, f, ensure_ascii=False)
-            os.replace(tmp, self.store_path)
-            self._last_save_ts = now
-            self._dirty = False
-        except Exception:
-            return
-
-    @staticmethod
-    def _trim_rules_in_place(bank: Dict[str, Dict[str, object]], max_n: int) -> None:
-        if len(bank) <= max_n:
-            return
-        ranked = sorted(
-            bank.items(),
-            key=lambda kv: (-int(kv[1].get("hits", 0)), -float(kv[1].get("ts", 0)), -len(kv[0])),
-        )[:max_n]
-        bank.clear()
-        for k, v in ranked:
-            bank[k] = v
-
-    @staticmethod
-    def _safe_fragment(text: str) -> bool:
-        t = (text or "").strip()
-        if not t:
-            return False
-        if len(t) > 24:
-            return False
-        if re.fullmatch(r"[0-9\W_]+", t):
-            return False
-        return True
-
-    @staticmethod
-    def _contains_cjk(text: str) -> bool:
-        return any("\u4e00" <= ch <= "\u9fff" for ch in (text or ""))
-
-    @staticmethod
-    def _normalize_edit_text(text: str) -> str:
-        return re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]+", "", (text or "").strip())
-
-    @classmethod
-    def _is_low_value_fragment(cls, text: str) -> bool:
-        t = cls._normalize_edit_text(text)
-        if not t:
-            return True
-        return len(t) <= 3 and all(ch in cls._LOW_VALUE_CN_CHARS for ch in t)
-
-    @classmethod
-    def _safe_rule_pair(cls, src: str, dst: str) -> bool:
-        a = (src or "").strip()
-        b = (dst or "").strip()
-        if not cls._safe_fragment(a) or not cls._safe_fragment(b):
-            return False
-        if a == b:
-            return False
-        a_norm = cls._normalize_edit_text(a)
-        b_norm = cls._normalize_edit_text(b)
-        if not a_norm or not b_norm:
-            return False
-        if len(a_norm) == 1 or len(b_norm) == 1:
-            return False
-        if cls._contains_cjk(a_norm + b_norm) and min(len(a_norm), len(b_norm)) < 2:
-            return False
-        if cls._is_low_value_fragment(a_norm) and cls._is_low_value_fragment(b_norm):
-            return False
-        return True
-
-    @classmethod
-    def _meaningful_exact_pair(cls, src: str, dst: str) -> bool:
-        s = (src or "").strip()
-        d = (dst or "").strip()
-        if not s or not d or s == d:
-            return False
-        meaningful_edits = 0
-        sm = difflib.SequenceMatcher(None, s, d, autojunk=False)
-        for tag, i1, i2, j1, j2 in sm.get_opcodes():
-            if tag == "equal":
-                continue
-            a = cls._normalize_edit_text(s[i1:i2])
-            b = cls._normalize_edit_text(d[j1:j2])
-            if not a and not b:
-                continue
-            if cls._is_low_value_fragment(a) and cls._is_low_value_fragment(b):
-                continue
-            meaningful_edits += 1
-        return meaningful_edits > 0
-
-    def _sanitize_loaded_entries(self) -> None:
-        exact_clean: Dict[str, Dict[str, object]] = {}
-        for src, meta in self._exact.items():
-            dst = str(meta.get("dst", "")).strip()
-            if not self._meaningful_exact_pair(src, dst):
-                self._dirty = True
-                continue
-            exact_clean[src] = meta
-        rules_clean: Dict[str, Dict[str, object]] = {}
-        for src, meta in self._rules.items():
-            dst = str(meta.get("dst", "")).strip()
-            if not self._safe_rule_pair(src, dst):
-                self._dirty = True
-                continue
-            rules_clean[src] = meta
-        self._exact = exact_clean
-        self._rules = rules_clean
-        if self._dirty:
-            self._save(force=True)
-
-    def _upsert(self, bank: Dict[str, Dict[str, object]], src: str, dst: str) -> None:
-        now = time.time()
-        row = bank.get(src)
-        if row is None:
-            bank[src] = {"dst": dst, "hits": 1, "ts": now}
-            self._dirty = True
-            return
-        prev_dst = str(row.get("dst", ""))
-        hits = int(row.get("hits", 0))
-        if prev_dst == dst:
-            row["hits"] = hits + 1
-            row["ts"] = now
-            self._dirty = True
-            return
-        if hits <= 2:
-            row["dst"] = dst
-            row["hits"] = 1
-            row["ts"] = now
-            self._dirty = True
-
-    def apply(self, text: str) -> str:
-        if not self.enabled:
-            return text
-        src = (text or "").strip()
-        if not src:
-            return text
-        row = self._exact.get(src)
-        if row and int(row.get("hits", 0)) >= max(3, self.min_hits):
-            dst = str(row.get("dst", "")).strip()
-            if dst and self._meaningful_exact_pair(src, dst):
-                return dst
-
-        out = src
-        ranked = sorted(
-            self._rules.items(),
-            key=lambda kv: (-int(kv[1].get("hits", 0)), -len(kv[0])),
-        )
-        for bad, meta in ranked:
-            hits = int(meta.get("hits", 0))
-            if hits < self.min_hits:
-                continue
-            good = str(meta.get("dst", "")).strip()
-            if not good or bad == good or not self._safe_rule_pair(bad, good):
-                continue
-            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{1,}", bad):
-                out = re.sub(rf"\b{re.escape(bad)}\b", good, out)
-            else:
-                out = out.replace(bad, good)
-        return out
-
-    def learn(self, src: str, dst: str) -> None:
-        if not self.enabled:
-            return
-        s = (src or "").strip()
-        d = (dst or "").strip()
-        if not s or not d or s == d:
-            return
-        ratio = difflib.SequenceMatcher(None, s, d).ratio()
-        if ratio < 0.32:
-            return
-        if not self._meaningful_exact_pair(s, d):
-            return
-        self._upsert(self._exact, s, d)
-
-        sm = difflib.SequenceMatcher(None, s, d, autojunk=False)
-        for tag, i1, i2, j1, j2 in sm.get_opcodes():
-            if tag != "replace":
-                continue
-            a = s[i1:i2].strip()
-            b = d[j1:j2].strip()
-            if not self._safe_rule_pair(a, b):
-                continue
-            self._upsert(self._rules, a, b)
-
-        self._trim_rules_in_place(self._exact, self.max_rules)
-        self._trim_rules_in_place(self._rules, self.max_rules)
-        self._save(force=False)
-
-    def flush(self) -> None:
-        self._save(force=True)
-
-
 class LLMPostProcessor:
     PROMPTS = {
         "correct": (
@@ -2451,37 +2200,6 @@ def parse_args() -> argparse.Namespace:
         help="Low-confidence threshold (stronger post-LLM correction)",
     )
     p.add_argument(
-        "--learn-loop",
-        type=int,
-        choices=[0, 1],
-        default=int(os.environ.get("SENSEVOICE_LEARN_ENABLE", "1")),
-        help="Enable correction memory loop",
-    )
-    p.add_argument(
-        "--learn-store",
-        default=os.environ.get(
-            "SENSEVOICE_LEARN_STORE",
-            os.path.join(
-                os.environ.get("XDG_STATE_HOME", os.path.join(os.path.expanduser("~"), ".local/state")),
-                "sensevoice-vibe",
-                "correction_memory.json",
-            ),
-        ),
-        help="Persistent store for correction memory",
-    )
-    p.add_argument(
-        "--learn-min-hits",
-        type=int,
-        default=int(os.environ.get("SENSEVOICE_LEARN_MIN_HITS", "2")),
-        help="Minimum hits before phrase replacement rule becomes active",
-    )
-    p.add_argument(
-        "--learn-max-rules",
-        type=int,
-        default=int(os.environ.get("SENSEVOICE_LEARN_MAX_RULES", "320")),
-        help="Maximum number of stored correction rules",
-    )
-    p.add_argument(
         "--compare-log",
         type=int,
         choices=[0, 1],
@@ -2954,13 +2672,6 @@ def main() -> int:
         high=args.conf_high,
         low=args.conf_low,
     )
-    correction_memory = CorrectionMemory(
-        enabled=bool(args.learn_loop),
-        store_path=args.learn_store,
-        min_hits=args.learn_min_hits,
-        max_rules=args.learn_max_rules,
-    )
-
     active = args.active_on_start if args.resident else True
     model_ready = False
     append_state_log(args.state_log, f"BOOT_BEGIN resident={int(args.resident)} active={int(active)}")
@@ -3041,17 +2752,6 @@ def main() -> int:
             int(bool(args.conf_route)),
             conf_router.high,
             conf_router.low,
-        ),
-    )
-    append_state_log(
-        args.state_log,
-        "LEARN_LOOP requested={} enabled={} min_hits={} max_rules={} store={} reason={}".format(
-            int(bool(args.learn_loop)),
-            int(correction_memory.enabled),
-            args.learn_min_hits,
-            args.learn_max_rules,
-            args.learn_store,
-            correction_memory.reason,
         ),
     )
     append_state_log(
@@ -3403,18 +3103,6 @@ def main() -> int:
                     if not final_text:
                         pass
                     else:
-                        source_text = final_text
-                        if correction_memory.enabled:
-                            mem_text = correction_memory.apply(final_text)
-                            if mem_text != final_text:
-                                append_state_log(
-                                    args.state_log,
-                                    "LEARN_APPLY src={} dst={}".format(
-                                        compact_log_text(final_text),
-                                        compact_log_text(mem_text),
-                                    ),
-                                )
-                                final_text = mem_text
                         compare_rec["after_memory"] = final_text
 
                         conf_score = conf_router.estimate(
@@ -3515,15 +3203,6 @@ def main() -> int:
                                 final_text = lex_text
                         compare_rec["after_lexicon"] = final_text
 
-                        if correction_memory.enabled and final_text and final_text != source_text:
-                            correction_memory.learn(source_text, final_text)
-                            append_state_log(
-                                args.state_log,
-                                "LEARN_UPDATE src={} dst={}".format(
-                                    compact_log_text(source_text),
-                                    compact_log_text(final_text),
-                                ),
-                            )
                         if final_text:
                             mode = "FINAL" if args.auto_enter else "PARTIAL"
                             compare_rec["final_injected"] = final_text
@@ -3550,7 +3229,6 @@ def main() -> int:
         stop_capture("shutdown")
         indicator.on_shutdown()
         injector.close()
-        correction_memory.flush()
         write_status(active=False, ready=model_ready, stopping=True)
         with open(pid_file, "w", encoding="utf-8") as f:
             f.write("")
