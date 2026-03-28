@@ -16,6 +16,9 @@ __pycache__/
 # 配置（含密钥，用模板替代）
 llm.env
 
+# 生成文件（从 .xml.in 模板生成）
+ibus-sensevoice/sensevoice-voice.xml
+
 # 测试临时文件
 test_ibus_commit.py
 last_failed_inject.txt

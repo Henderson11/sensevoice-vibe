@@ -1,53 +1,30 @@
 #!/usr/bin/env bash
+# 安装 systemd user service，开机自启 SenseVoice 语音输入
+# 所有配置从 ~/.config/sensevoice-vibe/llm.env 读取
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VENV_DIR="$ROOT_DIR/.venv"
 UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 UNIT_FILE="$UNIT_DIR/sensevoice-vibe.service"
+TEMPLATE="$ROOT_DIR/config/sensevoice-vibe.service.example"
+LLM_ENV="$HOME/.config/sensevoice-vibe/llm.env"
 
 mkdir -p "$UNIT_DIR"
+mkdir -p "$(dirname "$LLM_ENV")"
 
-cat >"$UNIT_FILE" <<EOF
-[Unit]
-Description=SenseVoice Resident VAD Daemon
-After=default.target
+# 如果配置文件不存在，从模板复制
+if [[ ! -f "$LLM_ENV" ]]; then
+  cp "$ROOT_DIR/config/llm.env.example" "$LLM_ENV"
+  echo "Created config: $LLM_ENV"
+  echo "Please edit it to fill in API keys before starting the service."
+fi
 
-[Service]
-Type=simple
-WorkingDirectory=$ROOT_DIR
-Environment=SENSEVOICE_RESIDENT=1
-Environment=SENSEVOICE_STREAM_ACTIVE_ON_START=0
-Environment=SENSEVOICE_MODEL=%h/.cache/modelscope/hub/models/iic/SenseVoiceSmall
-Environment=SENSEVOICE_LANGUAGE=zn
-Environment=SENSEVOICE_FILTER_FILLERS=1
-Environment=SENSEVOICE_PARTIAL_STRATEGY=stable2
-Environment=SENSEVOICE_EMIT_PARTIAL=0
-Environment=SENSEVOICE_AUTO_ENTER=0
-Environment=SENSEVOICE_PREFER_WTYPE=0
-Environment=SENSEVOICE_PASTE_KEY=shift_insert
-Environment=SENSEVOICE_YDOTOOL_KEY_DELAY_MS=20
-Environment=SENSEVOICE_CLIPBOARD_SETTLE_SEC=0.03
-Environment=SENSEVOICE_CLIPBOARD_VERIFY=0
-Environment=SENSEVOICE_CLEAR_BEFORE_REPLACE=0
-Environment=SENSEVOICE_STREAM_INDICATOR=notify_once
-Environment=SENSEVOICE_STREAM_VAD_AGGRESSIVENESS=1
-Environment=SENSEVOICE_STREAM_START_MS=80
-Environment=SENSEVOICE_STREAM_FRAME_MS=20
-Environment=SENSEVOICE_STREAM_ENDPOINT_MS=500
-Environment=SENSEVOICE_STREAM_MAX_SEGMENT_MS=8000
-Environment=SENSEVOICE_STREAM_PARTIAL_INTERVAL_MS=280
-Environment=SENSEVOICE_STREAM_MIN_PARTIAL_MS=700
-ExecStart=$VENV_DIR/bin/python $ROOT_DIR/stream_vad_realtime.py --resident --language zn --indicator notify_once
-Restart=always
-RestartSec=1
-
-[Install]
-WantedBy=default.target
-EOF
+# 从模板生成 service 文件，替换安装路径
+sed "s|__INSTALL_DIR__|$ROOT_DIR|g" "$TEMPLATE" > "$UNIT_FILE"
 
 systemctl --user daemon-reload
 systemctl --user enable --now sensevoice-vibe.service
 
 echo "Installed: $UNIT_FILE"
+echo "Config: $LLM_ENV"
 systemctl --user --no-pager --full status sensevoice-vibe.service | sed -n '1,20p'

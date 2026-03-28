@@ -2,7 +2,7 @@
 <component>
 	<name>im.sensevoice.SenseVoice</name>
 	<description>SenseVoice Voice Input Engine</description>
-	<exec>/usr/bin/python3 /home/dell/mosim_workspace/work/sensevoice-local-small/ibus-sensevoice/sensevoice_engine.py --ibus</exec>
+	<exec>/usr/bin/python3 @ENGINE_PATH@/sensevoice_engine.py --ibus</exec>
 	<version>0.1</version>
 	<author>sensevoice</author>
 	<license>MIT</license>
