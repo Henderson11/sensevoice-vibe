@@ -1,269 +1,107 @@
-# SenseVoice Local Deployment
+# SenseVoice 语音输入系统
 
-This folder provides a local deployment for SenseVoice using FunASR.
+基于 FunASR SenseVoice 的实时语音输入系统，支持 IBus 直接注入、LLM 后处理润色、声纹门禁。
 
-## Note on "SenseVoice Large 2.0"
-As of 2026-02-21, public downloadable checkpoints on ModelScope are `iic/SenseVoiceSmall` and `iic/SenseVoiceSmall-onnx`.
-If you have a private/local `SenseVoice Large 2.0` checkpoint, pass it with `--model /path/to/model_dir`.
+## 架构
 
-## 1) Setup
+```
+麦克风 → VAD(webrtcvad) → ASR(SenseVoice) → 声纹验证(ECAPA-TDNN)
+  → 置信度路由 → LLM润色(DeepSeek) → IBus commit_text → 输入框
+```
+
+## 模块结构
+
+```
+├── stream_vad_realtime.py          # 核心管线：VAD + ASR + 声纹 + LLM后处理
+├── ibus-sensevoice/                # IBus 注入引擎
+│   ├── sensevoice_engine.py        #   socket → commit_text
+│   ├── sensevoice-voice.xml        #   IBus 组件注册
+│   └── test_inject.py              #   注入测试
+├── toggle_resident_f8.sh           # F8 热键控制（常驻进程 + 信号切换）
+├── configure_f8.sh                 # GNOME 快捷键配置
+├── enroll_speaker_f8.sh            # 声纹模板采集
+├── send_to_focus_ydotool.sh        # 剪贴板注入后端（兼容模式）
+├── install_ibus_engine.sh          # IBus 引擎安装
+├── install_autostart_service.sh    # systemd 自启服务安装
+├── config/
+│   ├── llm.env.example             # 配置模板（不含密钥）
+│   └── sensevoice-vibe.service.example  # systemd 服务模板
+├── hotwords_coding_zh.txt          # 编程术语热词表
+└── requirements.txt                # Python 依赖
+```
+
+## 安装
 
 ```bash
-cd /home/dell/mosim_workspace/work/sensevoice-local-small
+# 1. 创建虚拟环境并安装依赖
 ./setup.sh
-```
+# 或手动：
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
 
-## 1.5) Configure F8 Resident Toggle
+# 2. 下载 ASR 模型（首次自动下载到 ~/.cache/modelscope/）
+# 或手动指定本地路径
 
-This config is ready even before microphone arrives.
+# 3. 安装 IBus 引擎（ibus 注入模式需要）
+./install_ibus_engine.sh
 
-```bash
-cd /home/dell/mosim_workspace/work/sensevoice-local-small
+# 4. 复制配置文件并填入 API 密钥
+cp config/llm.env.example ~/.config/sensevoice-vibe/llm.env
+# 编辑 llm.env 填入 POST_LLM_BASE_URL 和 API_KEY
+
+# 5. 配置 F8 快捷键
 ./configure_f8.sh
-```
 
-What it configures:
-- GNOME global hotkey: `F8` -> `toggle_resident_f8.sh toggle`
-  - `F8` toggles listening `ON/OFF`
-  - ASR model is resident (no reload on each F8)
-  - while listening: speech start/end is detected automatically
-  - default safety mode: inject only endpoint final text (no mid-sentence rewrite)
+# 6.（可选）采集声纹模板
+./enroll_speaker_f8.sh
 
-State files:
-- `${XDG_STATE_HOME:-$HOME/.local/state}/sensevoice-vibe`
-- includes `resident.pid`, `resident.status`, `stream_vad.log`
-
-## 1.6) Auto Start Resident Daemon (recommended)
-
-Enable user-level autostart after desktop login:
-
-```bash
-cd /home/dell/mosim_workspace/work/sensevoice-local-small
+# 7.（可选）安装开机自启服务
 ./install_autostart_service.sh
 ```
 
-Check service status:
+## 配置
+
+**所有配置集中在一个文件：`~/.config/sensevoice-vibe/llm.env`**
+
+F8 快捷键和 toggle 脚本均从此文件读取，修改后重启服务即可生效。
+
+关键配置项：
+
+| 配置 | 说明 | 默认值 |
+|------|------|--------|
+| `SENSEVOICE_INJECT_MODE` | 注入模式 (ibus/clipboard) | ibus |
+| `SENSEVOICE_STREAM_ENDPOINT_MS` | 停顿断句阈值 (ms) | 900 |
+| `SENSEVOICE_STREAM_MAX_SEGMENT_MS` | 单段最大时长 (ms) | 20000 |
+| `SENSEVOICE_SPK_ENABLE` | 声纹门禁开关 | 1 |
+| `SENSEVOICE_SPK_THRESHOLD` | 声纹相似度阈值 | 0.45 |
+| `SENSEVOICE_POST_LLM_ENABLE` | LLM 润色开关 | 1 |
+| `SENSEVOICE_POST_LLM_MODEL` | 润色模型 | DeepSeek-V3.2 |
+| `SENSEVOICE_LANGUAGE` | 识别语言 (auto/zh/en) | auto |
+
+## 使用
 
 ```bash
-systemctl --user status sensevoice-vibe.service
+# F8 开启/关闭语音输入（GNOME 全局快捷键）
+# 第一次 F8：开始监听
+# 说话 → 自动断句 → 润色 → 注入到当前输入框
+# 第二次 F8：停止监听
+
+# 手动启动（调试用）
+./toggle_resident_f8.sh on
+
+# 查看状态
+./toggle_resident_f8.sh status
+
+# 查看实时日志
+tail -f ~/.local/state/sensevoice-vibe/stream_vad.log
 ```
 
-## 1.7) Enable Ydotool Focus Mode (one-time root setup)
+## 依赖
 
-`ydotool` needs `/dev/uinput` access. Run these once in your normal terminal:
-
-```bash
-sudo apt-get update
-sudo apt-get install -y ydotool
-sudo modprobe uinput
-echo uinput | sudo tee /etc/modules-load.d/uinput.conf
-echo 'KERNEL=="uinput", MODE="0660", GROUP="input", OPTIONS+="static_node=uinput"' \
-  | sudo tee /etc/udev/rules.d/80-ydotool-uinput.rules
-sudo usermod -aG input "$USER"
-```
-
-Then re-login (or reboot) so group changes take effect.
-
-For this machine, recommended focus injection is `ydotool + clipboard paste`.
-Do not rely on `ydotool type` for Chinese input scenarios.
-
-## 1.8) Parallel A/B: Sherpa-onnx Runtime (recommended for latency test)
-
-Install sherpa runtime and download a Chinese streaming int8 model:
-
-```bash
-cd /home/dell/mosim_workspace/work/sensevoice-local-small
-./setup_sherpa.sh
-```
-
-Install sherpa resident user service:
-
-```bash
-./install_sherpa_autostart_service.sh
-systemctl --user status sherpa-vibe.service
-```
-
-Optional hotkey for parallel testing (keep existing F8 unchanged):
-
-```bash
-./configure_f7_sherpa.sh
-```
-
-What it configures:
-- GNOME global hotkey: `F7` -> `toggle_sherpa_resident.sh toggle`
-- `F8` remains FunASR/SenseVoice resident path
-- `F7` becomes sherpa-onnx resident path
-
-Sherpa model path (default):
-- `models/sherpa-onnx/sherpa-onnx-streaming-zipformer-zh-xlarge-int8-2025-06-30`
-- Punctuation model (default):
-- `models/sherpa-onnx/sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12-int8/model.int8.onnx`
-
-## 2) Run
-
-```bash
-./run.sh /path/to/audio.wav
-```
-
-Optional args:
-
-```bash
-./run.sh /path/to/audio.wav --device cpu --language auto --model iic/SenseVoiceSmall
-```
-
-If you have a private/local SenseVoice Large 2.0 checkpoint:
-
-```bash
-./run.sh /path/to/audio.wav --model /path/to/SenseVoice-Large-2.0
-```
-
-## 3) Output
-`transcribe.py` prints JSON with:
-- `text`: post-processed transcript
-- `raw`: original model output
-
-## 4) Vibe Coding Workflow (Chinese Voice Command)
-
-Record one short command from microphone (6 seconds):
-
-```bash
-arecord -q -f S16_LE -r 16000 -c 1 -d 6 /tmp/vibe_cmd.wav
-```
-
-Transcribe it:
-
-```bash
-./run.sh /tmp/vibe_cmd.wav --language auto --disable-update
-```
-
-Extract only recognized text:
-
-```bash
-./run.sh /tmp/vibe_cmd.wav --language auto --disable-update \
-  | python3 -c 'import sys,json; s=sys.stdin.read(); i=s.rfind("{"); print(json.loads(s[i:])["text"])'
-```
-
-Pass recognized command to coding tool (Codex wrapper):
-
-```bash
-CMD="$(./run.sh /tmp/vibe_cmd.wav --language auto --disable-update \
-  | python3 -c 'import sys,json; s=sys.stdin.read(); i=s.rfind("{"); print(json.loads(s[i:])["text"])')"
-/home/dell/mosim_workspace/scripts/code-with-codex.sh "$CMD" /home/dell/mosim_workspace
-```
-
-If default microphone is not correct, list devices:
-
-```bash
-arecord -l
-```
-
-## 5) Direct Output To CLI Chat Box (No Clipboard)
-
-Recommended on your machine (Wayland): run coding CLI in `tmux`, then inject text via `tmux send-keys`.
-
-Start CLI in tmux:
-
-```bash
-tmux new -s vibe
-# in tmux pane:
-codex
-```
-
-Find target pane id:
-
-```bash
-tmux list-panes -a -F '#{session_name}:#{window_index}.#{pane_index}'
-```
-
-Send one command line directly (as Enter):
-
-```bash
-printf '%s\n' '帮我在 utils/date.py 修复时区解析并补测试' \
-  | ./send_to_cli_tmux.sh vibe:0.0
-```
-
-Realtime update protocol:
-- `PARTIAL<TAB>...` only updates current input line
-- `FINAL<TAB>...` updates current line and presses Enter
-
-Example:
-
-```bash
-printf 'PARTIAL\t修复 utils 日期\nFINAL\t修复 utils.py 日期解析并补测试\n' \
-  | ./send_to_cli_tmux.sh vibe:0.0
-```
-
-## 6) F8 Runtime Behavior
-
-With microphone connected:
-- Global `F8` (GNOME): resident daemon control mode
-  - first `F8`: listening ON
-  - endpoint detected: final text is written to current focus input (default no Enter)
-  - second `F8`: listening OFF (daemon keeps running)
-
-Then press `Enter` manually when you confirm the text.
-
-If focus injection or tmux target is unavailable, text falls back to clipboard (`wl-copy`) when available.
-
-Useful runtime overrides:
-
-```bash
-SENSEVOICE_RESIDENT=1
-SENSEVOICE_STREAM_ACTIVE_ON_START=0|1
-SENSEVOICE_MODEL=/home/dell/.cache/modelscope/hub/models/iic/SenseVoiceSmall
-SENSEVOICE_LANGUAGE=zn|auto|en|yue|ja|ko
-SENSEVOICE_FILTER_FILLERS=1|0
-SENSEVOICE_PARTIAL_STRATEGY=stable2|raw
-SENSEVOICE_EMIT_PARTIAL=0|1
-SENSEVOICE_SESSION_NOTIFY=1|0
-SENSEVOICE_TOGGLE_DEBOUNCE_MS=450
-SENSEVOICE_PREFER_WTYPE=1|0
-SENSEVOICE_PASTE_KEY=shift_insert|ctrl_shift_v
-SENSEVOICE_YDOTOOL_KEY_DELAY_MS=20
-SENSEVOICE_CLIPBOARD_SETTLE_SEC=0.03
-SENSEVOICE_CLIPBOARD_VERIFY=0|1
-SENSEVOICE_CLEAR_BEFORE_REPLACE=0|1
-SENSEVOICE_STREAM_INDICATOR=notify_once|notify|none
-SENSEVOICE_STREAM_VAD_AGGRESSIVENESS=1
-SENSEVOICE_AUTO_ENTER=0|1
-SENSEVOICE_ARECORD_DEVICE=hw:Microphone,0
-SENSEVOICE_STREAM_START_MS=80
-SENSEVOICE_STREAM_FRAME_MS=20
-SENSEVOICE_STREAM_ENDPOINT_MS=500
-SENSEVOICE_STREAM_MAX_SEGMENT_MS=8000
-SENSEVOICE_STREAM_PARTIAL_INTERVAL_MS=280
-SENSEVOICE_STREAM_MIN_PARTIAL_MS=700
-SENSEVOICE_SHERPA_MODEL_DIR=/home/dell/mosim_workspace/work/sensevoice-local-small/models/sherpa-onnx/sherpa-onnx-streaming-zipformer-zh-xlarge-int8-2025-06-30
-SENSEVOICE_SHERPA_THREADS=4
-SENSEVOICE_SHERPA_DECODING=modified_beam_search|greedy_search
-SENSEVOICE_SHERPA_MAX_ACTIVE_PATHS=8
-SENSEVOICE_SHERPA_HOTWORDS_FILE=  # optional, default empty (disabled)
-SENSEVOICE_SHERPA_HOTWORDS_SCORE=1.8
-SENSEVOICE_SHERPA_BLANK_PENALTY=0.0
-SENSEVOICE_SHERPA_READ_MS=100
-SENSEVOICE_SHERPA_MAX_UTTERANCE_MS=12000
-SENSEVOICE_SHERPA_ENABLE_PUNC=1|0
-SENSEVOICE_SHERPA_PUNC_MODEL=/home/dell/mosim_workspace/work/sensevoice-local-small/models/sherpa-onnx/sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12-int8/model.int8.onnx
-SENSEVOICE_SHERPA_PUNC_THREADS=1
-```
-
-Quick A/B benchmark on one WAV:
-
-```bash
-./.venv/bin/python benchmark_compare_backends.py /path/to/audio.wav \
-  --sensevoice-model /home/dell/.cache/modelscope/hub/models/iic/SenseVoiceSmall \
-  --language zn
-```
-
-Manual fallback (old push-to-talk):
-
-```bash
-SENSEVOICE_OUTPUT_MODE=focus /home/dell/mosim_workspace/work/sensevoice-local-small/toggle_talk_f8.sh
-```
-
-## Verified on this machine
-Validated on 2026-02-21 with:
-
-```bash
-./run.sh /home/dell/.cache/modelscope/hub/models/iic/SenseVoiceSmall/example/en.mp3 --disable-update
-```
+- Python 3.10+
+- FunASR 1.3.1 (SenseVoice ASR)
+- SpeechBrain 1.0.3 (ECAPA-TDNN 声纹验证)
+- PyTorch 2.10+ (CPU 或 GPU)
+- webrtcvad (VAD)
+- IBus (GNOME 输入法框架)
+- OpenAI 兼容 API (LLM 后处理)
