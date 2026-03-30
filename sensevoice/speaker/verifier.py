@@ -48,6 +48,10 @@ class SpeakerVerifierGate:
         self.reason = "disabled"
         self.enroll_count = 0
         self._enroll_paths: List[str] = []
+        self._funasr_model = None
+        self._classifier = None
+        self._torch = None
+        self._F = None
         self.pruned_count = 0
 
         self.auto_enroll_requested = bool(auto_enroll)
@@ -86,30 +90,41 @@ class SpeakerVerifierGate:
             return
 
         try:
-            import torchaudio  # type: ignore
-
-            # speechbrain still expects these legacy torchaudio helpers in some versions.
-            if not hasattr(torchaudio, "list_audio_backends"):
-                torchaudio.list_audio_backends = lambda: ["soundfile"]  # type: ignore[attr-defined]
-            if not hasattr(torchaudio, "set_audio_backend"):
-                torchaudio.set_audio_backend = lambda backend: None  # type: ignore[attr-defined]
-            if not hasattr(torchaudio, "get_audio_backend"):
-                torchaudio.get_audio_backend = lambda: "soundfile"  # type: ignore[attr-defined]
-
             import torch  # type: ignore
             import torch.nn.functional as F  # type: ignore
-            from speechbrain.inference.speaker import SpeakerRecognition  # type: ignore
 
             self._torch = torch
             self._F = F
 
-            model_cache = os.path.expanduser(cache_dir or "~/.cache/sensevoice-vibe/spkrec")
-            os.makedirs(model_cache, exist_ok=True)
-            self._classifier = SpeakerRecognition.from_hparams(
-                source=model_id,
-                savedir=model_cache,
-                run_opts={"device": device},
+            # 优先使用 FunASR CAM++ 模型，回退到 SpeechBrain ECAPA-TDNN
+            use_funasr = "campplus" in (model_id or "").lower() or os.path.isfile(
+                os.path.join(model_id or "", "campplus_cn_common.bin")
             )
+
+            if use_funasr:
+                from funasr import AutoModel as FunASRModel  # type: ignore
+                self._funasr_model = FunASRModel(
+                    model=model_id,
+                    disable_update=True,
+                    disable_log=True,
+                    trust_remote_code=False,
+                )
+                self._classifier = None  # 不使用 SpeechBrain
+            else:
+                import torchaudio  # type: ignore
+                if not hasattr(torchaudio, "list_audio_backends"):
+                    torchaudio.list_audio_backends = lambda: ["soundfile"]  # type: ignore[attr-defined]
+                if not hasattr(torchaudio, "set_audio_backend"):
+                    torchaudio.set_audio_backend = lambda backend: None  # type: ignore[attr-defined]
+                if not hasattr(torchaudio, "get_audio_backend"):
+                    torchaudio.get_audio_backend = lambda: "soundfile"  # type: ignore[attr-defined]
+                from speechbrain.inference.speaker import SpeakerRecognition  # type: ignore
+                model_cache = os.path.expanduser(cache_dir or "~/.cache/sensevoice-vibe/spkrec")
+                os.makedirs(model_cache, exist_ok=True)
+                self._classifier = SpeakerRecognition.from_hparams(
+                    source=model_id, savedir=model_cache, run_opts={"device": device},
+                )
+                self._funasr_model = None
 
             emb_list = []
             for enroll_path in enroll_paths:
@@ -117,11 +132,8 @@ class SpeakerVerifierGate:
                 if sr != 16000:
                     enroll_samples = self._resample_linear(enroll_samples, sr, 16000)
                 if enroll_samples.size < 16000:
-                    # Ignore enrollment clips shorter than 1s; they are unstable for speaker verification.
                     continue
-                wav = torch.from_numpy(enroll_samples).float().unsqueeze(0)
-                with torch.no_grad():
-                    emb = self._classifier.encode_batch(wav).reshape(1, -1)
+                emb = self._extract_embedding(enroll_samples, torch)
                 emb_list.append(emb)
                 self._enroll_paths.append(enroll_path)
 
@@ -271,16 +283,28 @@ class SpeakerVerifierGate:
             wf.setframerate(int(sample_rate))
             wf.writeframes(pcm.tobytes())
 
+    def _extract_embedding(self, samples: np.ndarray, torch=None):
+        """提取说话人 embedding（支持 CAM++ 和 ECAPA-TDNN）"""
+        if torch is None:
+            torch = self._torch
+        if self._funasr_model is not None:
+            result = self._funasr_model.generate(input=samples)
+            emb_np = result[0]["spk_embedding"]
+            return torch.from_numpy(np.array(emb_np)).float().reshape(1, -1)
+        else:
+            wav = torch.from_numpy(samples).float().unsqueeze(0)
+            with torch.no_grad():
+                emb = self._classifier.encode_batch(wav)
+            return emb.reshape(1, -1)
+
     def verify(self, samples: np.ndarray, sample_rate: int, seg_ms: float) -> Tuple[bool, float, str, float]:
         if not self.enabled:
-            # Fail-open when verifier is unavailable.
             return True, 1.0, self.reason, self.threshold
         if seg_ms < self.min_ms:
             return False, 0.0, "too_short", self.threshold
 
         assert self._torch is not None
         assert self._F is not None
-        assert self._classifier is not None
         assert self._enroll_embeddings is not None
 
         torch = self._torch
@@ -289,11 +313,8 @@ class SpeakerVerifierGate:
         x = samples.astype(np.float32, copy=False)
         if sample_rate != 16000:
             x = self._resample_linear(x, sample_rate, 16000)
-        wav = torch.from_numpy(x).float().unsqueeze(0)
 
-        with torch.no_grad():
-            emb = self._classifier.encode_batch(wav)
-        emb = emb.reshape(1, -1)
+        emb = self._extract_embedding(x)
 
         # Compare against all enrollment templates.
         scores = F.cosine_similarity(self._enroll_embeddings, emb, dim=1)
