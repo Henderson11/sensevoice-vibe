@@ -384,11 +384,6 @@ class LLMPostProcessor:
             "temperature": self.temperature,
             "max_tokens": req_max_tokens,
             "stream": False,
-            # Best-effort flags for providers that support disabling reasoning mode.
-            "thinking": False,
-            "enable_thinking": False,
-            "reasoning_effort": "low",
-            "chat_template_kwargs": {"thinking": False},
         }
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         req = urllib.request.Request(
