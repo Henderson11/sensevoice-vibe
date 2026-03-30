@@ -115,6 +115,11 @@ class SenseVoicePipeline:
             dynamic_max_tokens=bool(args.post_llm_dynamic_max_tokens),
             output_token_factor=args.post_llm_output_token_factor,
         )
+        # 设置 fallback API 端点（内网不可用时降级到官方 API）
+        self.post_llm.fallback_url = getattr(args, 'post_llm_fallback_base_url', '') or os.environ.get('SENSEVOICE_POST_LLM_FALLBACK_BASE_URL', '')
+        self.post_llm.fallback_api_key = getattr(args, 'post_llm_fallback_api_key', '') or os.environ.get('SENSEVOICE_POST_LLM_FALLBACK_API_KEY', '')
+        if self.post_llm.fallback_url:
+            self.post_llm.fallback_url = LLMPostProcessor._normalize_endpoint(self.post_llm.fallback_url)
         self.project_lexicon = ProjectLexicon(
             enabled=bool(args.project_lexicon),
             project_root=args.project_root,

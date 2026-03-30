@@ -109,6 +109,8 @@ class LLMPostProcessor:
         self.model = (model or "").strip()
         self.initial_model = self.model
         self.fallback_model = (fallback_model or "").strip()
+        self.fallback_url = ""
+        self.fallback_api_key = ""
         mode_norm = (mode or "").strip().lower()
         self.mode = mode_norm if mode_norm in self.PROMPTS else "correct"
         # Guardrails vary by rewrite mode.
@@ -374,7 +376,10 @@ class LLMPostProcessor:
                 )
         return base
 
-    def _request_once(self, model_name: str, src: str, prompt: str, req_max_tokens: int) -> Tuple[str, str]:
+    def _request_once(self, model_name: str, src: str, prompt: str, req_max_tokens: int,
+                      url: str = "", api_key: str = "") -> Tuple[str, str]:
+        url = url or self.url
+        api_key = api_key or self.api_key
         payload = {
             "model": model_name,
             "messages": [
@@ -387,12 +392,12 @@ class LLMPostProcessor:
         }
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         req = urllib.request.Request(
-            self.url,
+            url,
             data=body,
             method="POST",
             headers={
                 "Content-Type": "application/json",
-                "Authorization": f"Bearer {self.api_key}",
+                "Authorization": f"Bearer {api_key}",
             },
         )
         try:
@@ -489,8 +494,11 @@ class LLMPostProcessor:
 
         # Some providers/models return reasoning-only responses for thinking models.
         # Fallback model keeps the chain usable for low-latency correction.
-        if self.fallback_model and self.fallback_model != self.model:
-            out2, err2 = self._request_once(self.fallback_model, src, prompt, req_max_tokens)
+        if self.fallback_model:
+            out2, err2 = self._request_once(
+                self.fallback_model, src, prompt, req_max_tokens,
+                url=self.fallback_url, api_key=self.fallback_api_key,
+            )
             if out2:
                 self._note_success()
                 return out2
