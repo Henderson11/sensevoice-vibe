@@ -258,6 +258,12 @@ class SenseVoicePipeline:
 
     def _setup_signals(self):
         def _stop(_sig, _frame):
+            import traceback
+            sig_name = signal.Signals(_sig).name if hasattr(signal, 'Signals') else str(_sig)
+            append_state_log(
+                self.args.state_log,
+                f"SIGNAL_STOP sig={sig_name} pid={os.getpid()} ppid={os.getppid()}",
+            )
             self.stop_flag = True
 
         def _toggle(_sig, _frame):

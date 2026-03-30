@@ -90,6 +90,7 @@ class LLMPostProcessor:
         self.requested = bool(enabled)
         self.enabled = False
         self.reason = "off"
+        self.last_error = ""
         self.timeout_sec = max(0.2, float(timeout_ms) / 1000.0)
         self.max_tokens = max(32, int(max_tokens))
         self.temperature = float(temperature)
@@ -153,6 +154,7 @@ class LLMPostProcessor:
     def _note_success(self) -> None:
         self._fail_streak = 0
         self._circuit_open_until = 0.0
+        self.last_error = ""
 
     def _note_failure(self, reason: str) -> None:
         hard_tags = ("model_not_found", "http_auth", "api_key_missing", "base_url_missing")
