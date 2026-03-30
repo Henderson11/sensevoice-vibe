@@ -6,9 +6,9 @@ import os
 import time
 
 
-def append_state_log(path: str, text: str) -> None:
+def append_state_log(path: str, text: str, level: str = "INFO") -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    line = f"{time.strftime('%F %T')} {text}\n"
+    line = f"{time.strftime('%F %T')} [{level}] {text}\n"
     with open(path, "a", encoding="utf-8") as f:
         f.write(line)
 
@@ -32,6 +32,15 @@ def append_state_log(path: str, text: str) -> None:
             wf.writelines(kept)
     except Exception:
         pass
+
+
+def log_with_latency(path: str, event: str, start_time: float, **extra) -> None:
+    """Record an event together with its latency in milliseconds."""
+    latency_ms = (time.time() - start_time) * 1000
+    parts = [f"{event} latency_ms={latency_ms:.0f}"]
+    for k, v in extra.items():
+        parts.append(f"{k}={v}")
+    append_state_log(path, " ".join(parts))
 
 
 def append_jsonl_bounded(path: str, obj: dict, keep_lines: int = 400) -> None:

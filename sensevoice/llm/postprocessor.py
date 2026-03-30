@@ -7,6 +7,7 @@ import collections
 import json
 import os
 import re
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -527,7 +528,8 @@ class LLMPostProcessor:
             body = ""
             try:
                 body = e.read().decode("utf-8", errors="replace")
-            except Exception:
+            except Exception as read_exc:
+                print(f"[sensevoice] warning: failed to read HTTP error body: {read_exc}", file=sys.stderr)
                 body = ""
             lower = body.lower()
             if e.code in (401, 403):

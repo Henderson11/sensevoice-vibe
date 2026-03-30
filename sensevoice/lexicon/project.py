@@ -7,6 +7,7 @@ import collections
 import difflib
 import os
 import re
+import sys
 from typing import Dict, List, Tuple
 
 from sensevoice.text.constants import COMMON_TECH_STOPWORDS, IDENT_RE, TECH_TOKEN_RE
@@ -162,7 +163,8 @@ class ProjectLexicon:
                         continue
                     with open(fp, "r", encoding="utf-8", errors="ignore") as f:
                         raw = f.read(max_bytes)
-                except Exception:
+                except Exception as exc:
+                    print(f"[sensevoice] warning: failed to read {fp}: {exc}", file=sys.stderr)
                     continue
                 scanned += 1
                 for tok in IDENT_RE.findall(raw):
@@ -181,7 +183,8 @@ class ProjectLexicon:
                         continue
                     for tok in IDENT_RE.findall(t):
                         self._collect_term(counter, tok, weight=3)
-        except Exception:
+        except Exception as exc:
+            print(f"[sensevoice] warning: failed to read extra terms file {self.extra_terms_file}: {exc}", file=sys.stderr)
             return
 
     def contains(self, token: str) -> bool:

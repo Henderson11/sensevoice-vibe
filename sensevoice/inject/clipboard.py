@@ -18,6 +18,23 @@ class FocusInjector:
     def _ensure(self) -> None:
         if self.proc is not None and self.proc.poll() is None:
             return
+        # Terminate stale process (exited but not yet cleaned up) before
+        # creating a new one, preventing leaked zombie/orphan processes.
+        if self.proc is not None:
+            try:
+                if self.proc.stdin:
+                    self.proc.stdin.close()
+            except Exception:
+                pass
+            try:
+                self.proc.terminate()
+                self.proc.wait(timeout=2)
+            except Exception:
+                try:
+                    self.proc.kill()
+                except Exception:
+                    pass
+            self.proc = None
         self.proc = subprocess.Popen(
             [self.script_path],
             stdin=subprocess.PIPE,

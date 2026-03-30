@@ -49,13 +49,12 @@ class IBusInjector:
         while time.monotonic() < deadline:
             if os.path.exists(self._sock_path):
                 try:
-                    s = self._socket_mod.socket(
+                    with self._socket_mod.socket(
                         self._socket_mod.AF_UNIX, self._socket_mod.SOCK_STREAM
-                    )
-                    s.settimeout(0.3)
-                    s.connect(self._sock_path)
-                    s.close()
-                    return True
+                    ) as s:
+                        s.settimeout(0.3)
+                        s.connect(self._sock_path)
+                        return True
                 except OSError:
                     pass
             time.sleep(0.1)
@@ -95,27 +94,22 @@ class IBusInjector:
     def _try_socket_send(self, line: str) -> bool:
         for _ in range(2):
             try:
-                s = self._socket_mod.socket(
+                with self._socket_mod.socket(
                     self._socket_mod.AF_UNIX, self._socket_mod.SOCK_STREAM
-                )
-                s.settimeout(self.ack_timeout_sec)
-                s.connect(self._sock_path)
-                s.sendall(line.encode("utf-8"))
-                ack = s.recv(256).decode("utf-8", errors="replace").strip()
-                s.close()
-                if ack.startswith("OK\t"):
-                    self.last_error = ""
-                    return True
-                if ack.startswith("ERR\t"):
-                    self.last_error = ack[4:] or "inject_error"
-                else:
-                    self.last_error = f"bad_ack:{ack[:80]}"
+                ) as s:
+                    s.settimeout(self.ack_timeout_sec)
+                    s.connect(self._sock_path)
+                    s.sendall(line.encode("utf-8"))
+                    ack = s.recv(256).decode("utf-8", errors="replace").strip()
+                    if ack.startswith("OK\t"):
+                        self.last_error = ""
+                        return True
+                    if ack.startswith("ERR\t"):
+                        self.last_error = ack[4:] or "inject_error"
+                    else:
+                        self.last_error = f"bad_ack:{ack[:80]}"
             except Exception as e:
                 self.last_error = f"{type(e).__name__}:{e}"
-                try:
-                    s.close()  # type: ignore[possibly-undefined]
-                except Exception:
-                    pass
         return False
 
     def close(self) -> None:
