@@ -6,7 +6,6 @@
 import collections
 import json
 import os
-import re
 import sys
 import time
 import urllib.error
@@ -365,71 +364,6 @@ class LLMPostProcessor:
             return output_text
         return ""
 
-    @staticmethod
-    def _clean_text(text: str) -> str:
-        t = (text or "").replace("\r", " ").replace("`", "").strip()
-        if not t:
-            return ""
-        # Remove a single surrounding quote pair if present.
-        quote_pairs = [('"', '"'), ("'", "'"), ("“", "”"), ("‘", "’")]
-        for ql, qr in quote_pairs:
-            if len(t) >= 2 and t.startswith(ql) and t.endswith(qr):
-                t = t[1:-1].strip()
-                break
-        return t
-
-    @staticmethod
-    def _looks_like_meta(text: str) -> bool:
-        lower = text.lower()
-        prefixes = (
-            "corrected text:",
-            "纠正后",
-            "修正后",
-            "以下是",
-            "抱歉",
-            "as an ai",
-        )
-        return any(lower.startswith(p) for p in prefixes)
-
-    @staticmethod
-    def _protected_tokens(src: str) -> List[str]:
-        # Keep technical/code-like tokens stable across rewrite.
-        raw = re.findall(r"[A-Za-z0-9_./:=+-]{2,}", src or "")
-        out: List[str] = []
-        seen = set()
-        for t in raw:
-            # Ignore pure numbers; keep command/code-like fragments.
-            if t.isdigit():
-                continue
-            key = t.lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            out.append(t)
-        return out
-
-    @staticmethod
-    def _contains_token(dst: str, token: str) -> bool:
-        return token.lower() in (dst or "").lower()
-
-    @staticmethod
-    def _looks_like_question(text: str) -> bool:
-        t = (text or "").strip()
-        if not t:
-            return False
-        if "?" in t or "？" in t:
-            return True
-        cues = ("吗", "么", "呢", "什么", "为何", "为什么", "如何", "怎么", "是不是", "能否", "可否")
-        return any(c in t for c in cues)
-
-    @staticmethod
-    def _looks_like_explanatory_answer(text: str) -> bool:
-        t = (text or "").strip()
-        if not t:
-            return False
-        cues = ("意思是", "是指", "指的是", "通常是", "可以理解为", "也就是说")
-        return any(c in t for c in cues)
-
     def _system_prompt(
         self,
         route: str = "mid",
@@ -498,31 +432,9 @@ class LLMPostProcessor:
             with urllib.request.urlopen(req, timeout=self.timeout_sec) as resp:
                 raw = resp.read().decode("utf-8", errors="replace")
             obj = json.loads(raw)
-            out = self._clean_text(self._extract_text(obj))
+            out = self._extract_text(obj).strip()
             if not out:
-                reason_text = ""
-                choices = obj.get("choices")
-                if isinstance(choices, list) and choices and isinstance(choices[0], dict):
-                    msg = choices[0].get("message")
-                    if isinstance(msg, dict):
-                        reason_text = str(msg.get("reasoning_content") or msg.get("reasoning") or "")
-                if reason_text.strip():
-                    return "", "reasoning_only"
                 return "", "empty_output"
-            if self._looks_like_meta(out):
-                return "", "meta_output"
-            # Guardrail: avoid verbose rewrites/hallucination.
-            if len(out) > max(80, int(len(src) * self.max_expand_ratio)):
-                return "", "too_long_output"
-            if len(src) >= 8 and len(out) < int(len(src) * self.min_keep_ratio):
-                return "", "too_short_output"
-            # Guardrail: preserve question intent, do not rewrite question into explanation answer.
-            if self._looks_like_question(src):
-                if not self._looks_like_question(out) and self._looks_like_explanatory_answer(out):
-                    return "", "qa_shift"
-            for tok in self._protected_tokens(src):
-                if not self._contains_token(out, tok):
-                    return "", f"token_missing:{tok}"
             return out, ""
         except urllib.error.HTTPError as e:
             body = ""
