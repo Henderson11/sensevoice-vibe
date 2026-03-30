@@ -76,8 +76,23 @@ def parse_args() -> argparse.Namespace:
         help="Optional arecord device, e.g. hw:Microphone,0",
     )
     p.add_argument(
+        "--inject-mode",
+        default=os.environ.get("SENSEVOICE_INJECT_MODE", "clipboard"),
+        choices=["ibus", "clipboard"],
+        help="Text injection backend: ibus (recommended) or clipboard",
+    )
+    p.add_argument(
         "--inject-script",
         default=os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "send_to_focus_ydotool.sh"),
+    )
+    p.add_argument(
+        "--post-llm-fallback-base-url",
+        default=os.environ.get("SENSEVOICE_POST_LLM_FALLBACK_BASE_URL", ""),
+        help="Fallback LLM API base URL (e.g. official DeepSeek API)",
+    )
+    p.add_argument(
+        "--post-llm-fallback-api-key",
+        default=os.environ.get("SENSEVOICE_POST_LLM_FALLBACK_API_KEY", ""),
     )
     p.add_argument(
         "--state-log",

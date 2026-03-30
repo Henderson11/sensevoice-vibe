@@ -34,14 +34,6 @@ def append_state_log(path: str, text: str, level: str = "INFO") -> None:
         pass
 
 
-def log_with_latency(path: str, event: str, start_time: float, **extra) -> None:
-    """Record an event together with its latency in milliseconds."""
-    latency_ms = (time.time() - start_time) * 1000
-    parts = [f"{event} latency_ms={latency_ms:.0f}"]
-    for k, v in extra.items():
-        parts.append(f"{k}={v}")
-    append_state_log(path, " ".join(parts))
-
 
 def append_jsonl_bounded(path: str, obj: dict, keep_lines: int = 400) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)

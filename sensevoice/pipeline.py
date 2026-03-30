@@ -127,8 +127,8 @@ class SenseVoicePipeline:
             output_token_factor=args.post_llm_output_token_factor,
         )
         # 设置 fallback API 端点（内网不可用时降级到官方 API）
-        self.post_llm.fallback_url = getattr(args, 'post_llm_fallback_base_url', '') or os.environ.get('SENSEVOICE_POST_LLM_FALLBACK_BASE_URL', '')
-        self.post_llm.fallback_api_key = getattr(args, 'post_llm_fallback_api_key', '') or os.environ.get('SENSEVOICE_POST_LLM_FALLBACK_API_KEY', '')
+        self.post_llm.fallback_url = getattr(args, 'post_llm_fallback_base_url', '') or ''
+        self.post_llm.fallback_api_key = getattr(args, 'post_llm_fallback_api_key', '') or ''
         if self.post_llm.fallback_url:
             self.post_llm.fallback_url = LLMPostProcessor._normalize_endpoint(self.post_llm.fallback_url)
         self.project_lexicon = ProjectLexicon(
@@ -145,12 +145,11 @@ class SenseVoicePipeline:
             low=args.conf_low,
         )
 
-        inject_mode = os.environ.get("SENSEVOICE_INJECT_MODE", "clipboard")
-        if inject_mode == "ibus":
+        if args.inject_mode == "ibus":
             self.injector = IBusInjector()
         else:
             self.injector = FocusInjector(args.inject_script)
-        self.inject_mode_name = inject_mode
+        self.inject_mode_name = args.inject_mode
 
         self.indicator = SpeechIndicator(args.indicator)
         self.vad = webrtcvad.Vad(args.vad_aggressiveness)

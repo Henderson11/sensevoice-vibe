@@ -187,9 +187,6 @@ class ProjectLexicon:
             print(f"[sensevoice] warning: failed to read extra terms file {self.extra_terms_file}: {exc}", file=sys.stderr)
             return
 
-    def contains(self, token: str) -> bool:
-        return token.lower() in self._terms_lower
-
     def hints_for_text(self, text: str) -> List[str]:
         if not self.enabled or self.hint_limit <= 0:
             return []
