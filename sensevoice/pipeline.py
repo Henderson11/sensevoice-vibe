@@ -44,6 +44,17 @@ class SenseVoicePipeline:
         self.toggle_count = 0
         self.force_active: Optional[bool] = None
 
+        # --- 组件（_init_components 中赋值，提前声明避免 finally 中 AttributeError）---
+        self.model = None
+        self.indicator = None
+        self.injector = None
+        self.speaker_gate = None
+        self.post_llm = None
+        self.project_lexicon = None
+        self.conf_router = None
+        self.vad = None
+        self.inject_mode_name = ""
+
         # --- VAD 状态 ---
         self.frame_samples = int(args.sample_rate * args.frame_ms / 1000)
         self.frame_bytes = self.frame_samples * 2
@@ -552,8 +563,10 @@ class SenseVoicePipeline:
                 self.pre_roll.clear()
         finally:
             self.stop_capture("shutdown")
-            self.indicator.on_shutdown()
-            self.injector.close()
+            if self.indicator:
+                self.indicator.on_shutdown()
+            if self.injector:
+                self.injector.close()
             self.write_status(active=False, ready=self.model_ready, stopping=True)
             with open(self.pid_file, "w", encoding="utf-8") as f:
                 f.write("")

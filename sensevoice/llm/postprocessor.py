@@ -114,19 +114,6 @@ class LLMPostProcessor:
         self.fallback_api_key = ""
         mode_norm = (mode or "").strip().lower()
         self.mode = mode_norm if mode_norm in self.PROMPTS else "correct"
-        # Guardrails vary by rewrite mode.
-        if self.mode == "polish_light":
-            self.min_keep_ratio = 0.60
-            self.max_expand_ratio = 1.50
-        elif self.mode == "polish_coding":
-            self.min_keep_ratio = 0.45
-            self.max_expand_ratio = 1.80
-        elif self.mode == "polish_coding_aggressive":
-            self.min_keep_ratio = 0.35
-            self.max_expand_ratio = 2.10
-        else:
-            self.min_keep_ratio = 0.50
-            self.max_expand_ratio = 2.20
         self.url = ""
         self.models_url = ""
         self.api_key = (api_key or "").strip()
