@@ -15,6 +15,7 @@ from sensevoice.text.processing import (
     looks_like_partial_noise, parse_wake_words, sanitize_transcript_text,
 )
 from sensevoice.asr.confidence import _select_focus_low_tokens
+from sensevoice.config.settings import SenseVoiceConfig
 from sensevoice.asr.router import ConfidenceRouter
 from sensevoice.asr.model import load_model, transcribe_array, transcribe_array_with_conf
 from sensevoice.inject.ibus import IBusInjector
@@ -423,6 +424,10 @@ class SenseVoicePipeline:
 
         with open(self.pid_file, "w", encoding="utf-8") as f:
             f.write(str(os.getpid()))
+
+        warnings = SenseVoiceConfig.validate(args)
+        for w in warnings:
+            append_state_log(args.state_log, f"CONFIG_WARN {w}", level="WARN")
 
         self._init_components()
         self._log_startup()

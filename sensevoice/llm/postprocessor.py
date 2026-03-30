@@ -3,9 +3,7 @@
 # chat endpoint for typo correction / light polish, with circuit-breaker,
 # fallback model, response caching, and guardrails against hallucination.
 
-import collections
 import json
-import os
 import sys
 import time
 import urllib.error
@@ -454,8 +452,6 @@ class LLMPostProcessor:
         if route_tag == "low":
             req_max_tokens = min(self.max_tokens, int(req_max_tokens * 1.5) + 12)
 
-        glossary_key = ",".join((glossary or [])[:8])
-        focus_key = ",".join((focus_tokens or [])[:6])
         now = time.time()
         if now < self._circuit_open_until:
             remain = int(max(1, self._circuit_open_until - now))

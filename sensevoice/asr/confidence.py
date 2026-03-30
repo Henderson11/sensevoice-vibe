@@ -14,6 +14,14 @@ from sensevoice.text.constants import (
     SHORT_NOISE_ZH,
 )
 
+# Confidence aggregation weights
+CONF_WEIGHT_MEAN_ALL = 0.55
+CONF_WEIGHT_MEAN_BOTTOM = 0.45
+CONF_WEIGHT_SHORT_MEAN_ALL = 0.70
+CONF_WEIGHT_SHORT_MEAN_BOTTOM = 0.30
+CONF_BOTTOM_N_LIMIT = 4
+CONF_SHORT_THRESHOLD = 3
+
 
 def _normalize_conf_token(token: str) -> str:
     return re.sub(r"\s+", "", (token or "").strip())
@@ -56,12 +64,12 @@ def _aggregate_display_conf_scores(token_scores: List[Dict[str, float]]) -> Opti
     if not values:
         return None
     ordered = sorted(values)
-    bottom_n = ordered[: max(1, min(4, len(ordered)))]
+    bottom_n = ordered[: max(1, min(CONF_BOTTOM_N_LIMIT, len(ordered)))]
     mean_all = float(np.mean(values))
     mean_bottom = float(np.mean(bottom_n))
-    conf = 0.55 * mean_all + 0.45 * mean_bottom
-    if len(values) <= 3:
-        conf = 0.70 * mean_all + 0.30 * mean_bottom
+    conf = CONF_WEIGHT_MEAN_ALL * mean_all + CONF_WEIGHT_MEAN_BOTTOM * mean_bottom
+    if len(values) <= CONF_SHORT_THRESHOLD:
+        conf = CONF_WEIGHT_SHORT_MEAN_ALL * mean_all + CONF_WEIGHT_SHORT_MEAN_BOTTOM * mean_bottom
     return float(np.clip(conf, 0.0, 1.0))
 
 
