@@ -140,6 +140,8 @@ class SpeakerVerifierGate:
                 f"adapt={int(self.adaptive_enable)},pruned={self.pruned_count}"
             )
         except Exception as e:
+            import sys
+            print(f"[sensevoice] warning: speaker verifier init failed: {type(e).__name__}: {e}", file=sys.stderr)
             self.reason = f"init_error:{type(e).__name__}"
             self.enabled = False
 
