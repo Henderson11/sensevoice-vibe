@@ -336,9 +336,19 @@ case "$action" in
     fi
     ;;
   --toggle|toggle|"")
+    was_running=0
+    if is_running; then
+      was_running=1
+    fi
     if ! ensure_running; then
       notify_msg "ASR daemon start failed"
       exit 2
+    fi
+    # 首次启动时等待模型加载完成（ACTIVE_ON_START=1 会自动激活）
+    if [[ "$was_running" == "0" ]]; then
+      log_toggle "CONTROL_TOGGLE cold_start"
+      notify_msg "ASR loading..."
+      exit 0
     fi
     current_active="$(read_active)"
     if [[ "$current_active" == "1" ]]; then
