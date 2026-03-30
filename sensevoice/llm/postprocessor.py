@@ -84,15 +84,12 @@ class LLMPostProcessor:
         model_auto: bool,
         model_probe_timeout_ms: int,
         min_chars: int,
-        cache_ttl_sec: int,
-        cache_max_entries: int,
         dynamic_max_tokens: bool,
         output_token_factor: float,
     ):
         self.requested = bool(enabled)
         self.enabled = False
         self.reason = "off"
-        self.last_error = ""
         self.timeout_sec = max(0.2, float(timeout_ms) / 1000.0)
         self.max_tokens = max(32, int(max_tokens))
         self.temperature = float(temperature)
@@ -106,11 +103,8 @@ class LLMPostProcessor:
         self.model_auto = bool(model_auto)
         self.model_probe_timeout_sec = max(0.2, float(model_probe_timeout_ms) / 1000.0)
         self.min_chars = max(1, int(min_chars))
-        self.cache_ttl_sec = max(0, int(cache_ttl_sec))
-        self.cache_max_entries = max(0, int(cache_max_entries))
         self.dynamic_max_tokens = bool(dynamic_max_tokens)
         self.output_token_factor = max(0.2, min(2.0, float(output_token_factor)))
-        self._cache: "collections.OrderedDict[str, Tuple[float, str]]" = collections.OrderedDict()
         self._model_ids: List[str] = []
         self.model = (model or "").strip()
         self.initial_model = self.model
@@ -157,7 +151,6 @@ class LLMPostProcessor:
     def _note_success(self) -> None:
         self._fail_streak = 0
         self._circuit_open_until = 0.0
-        self.last_error = ""
 
     def _note_failure(self, reason: str) -> None:
         hard_tags = ("model_not_found", "http_auth", "api_key_missing", "base_url_missing")
@@ -278,27 +271,6 @@ class LLMPostProcessor:
             self.fallback_model = self._pick_fallback_model(mids, self.model)
         return True
 
-    def _cache_get(self, key: str) -> str:
-        if self.cache_max_entries <= 0 or self.cache_ttl_sec <= 0:
-            return ""
-        row = self._cache.get(key)
-        if row is None:
-            return ""
-        ts, out = row
-        if time.time() - ts > self.cache_ttl_sec:
-            self._cache.pop(key, None)
-            return ""
-        # refresh LRU order
-        self._cache.move_to_end(key)
-        return out
-
-    def _cache_put(self, key: str, out: str) -> None:
-        if self.cache_max_entries <= 0 or self.cache_ttl_sec <= 0:
-            return
-        self._cache[key] = (time.time(), out)
-        self._cache.move_to_end(key)
-        while len(self._cache) > self.cache_max_entries:
-            self._cache.popitem(last=False)
 
     def _choose_max_tokens(self, src: str) -> int:
         if not self.dynamic_max_tokens:
@@ -495,11 +467,6 @@ class LLMPostProcessor:
 
         glossary_key = ",".join((glossary or [])[:8])
         focus_key = ",".join((focus_tokens or [])[:6])
-        cache_key = f"{route_tag}|g={glossary_key}|f={focus_key}|{src}"
-        cached = self._cache_get(cache_key)
-        if cached:
-            self.last_error = ""
-            return cached
         now = time.time()
         if now < self._circuit_open_until:
             remain = int(max(1, self._circuit_open_until - now))
@@ -513,18 +480,15 @@ class LLMPostProcessor:
             out_retry_to, err_retry_to = self._request_once(self.model, src, prompt, req_max_tokens)
             if out_retry_to:
                 self._note_success()
-                self._cache_put(cache_key, out_retry_to)
                 return out_retry_to
             err = f"timeout_retry:{err_retry_to or 'failed'}"
         if out:
             self._note_success()
-            self._cache_put(cache_key, out)
             return out
         if err == "model_not_found" and self.model_auto and self._autoselect_models():
             out_retry, err_retry = self._request_once(self.model, src, prompt, req_max_tokens)
             if out_retry:
                 self._note_success()
-                self._cache_put(cache_key, out_retry)
                 return out_retry
             err = f"{err};reprobe:{err_retry or 'failed'}"
 
@@ -534,7 +498,6 @@ class LLMPostProcessor:
             out2, err2 = self._request_once(self.fallback_model, src, prompt, req_max_tokens)
             if out2:
                 self._note_success()
-                self._cache_put(cache_key, out2)
                 return out2
             self._note_failure(f"primary:{err or 'failed'};fallback:{err2 or 'failed'}")
             return text

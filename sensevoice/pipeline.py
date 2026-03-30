@@ -112,8 +112,6 @@ class SenseVoicePipeline:
             model_auto=bool(args.post_llm_model_auto),
             model_probe_timeout_ms=args.post_llm_model_probe_timeout_ms,
             min_chars=args.post_llm_min_chars,
-            cache_ttl_sec=args.post_llm_cache_ttl_sec,
-            cache_max_entries=args.post_llm_cache_max_entries,
             dynamic_max_tokens=bool(args.post_llm_dynamic_max_tokens),
             output_token_factor=args.post_llm_output_token_factor,
         )
@@ -162,7 +160,7 @@ class SenseVoicePipeline:
             args.speaker_adaptive_margin, int(bool(args.speaker_prune_outliers)),
             args.speaker_prune_keep, self.speaker_gate.reason,
         ))
-        append_state_log(log, "POST_LLM requested={} enabled={} strict={} mode={} model={} fallback={} timeout_ms={} max_tokens={} temp={} max_fails={} cooldown_sec={} hard_cd={} retry_to={} retry_backoff_ms={} auto={} probe_ms={} min_chars={} cache_ttl={} cache_n={} dyn_tokens={} out_factor={} reason={}".format(
+        append_state_log(log, "POST_LLM requested={} enabled={} strict={} mode={} model={} fallback={} timeout_ms={} max_tokens={} temp={} max_fails={} cooldown_sec={} hard_cd={} retry_to={} retry_backoff_ms={} auto={} probe_ms={} min_chars={} dyn_tokens={} out_factor={} reason={}".format(
             int(bool(args.post_llm)), int(self.post_llm.enabled), int(bool(args.post_llm_strict)),
             args.post_llm_mode, self.post_llm.model or args.post_llm_model,
             self.post_llm.fallback_model or args.post_llm_fallback_model or "-",
@@ -171,7 +169,6 @@ class SenseVoicePipeline:
             args.post_llm_hard_cooldown_sec, int(bool(args.post_llm_retry_on_timeout)),
             args.post_llm_retry_backoff_ms, int(bool(args.post_llm_model_auto)),
             args.post_llm_model_probe_timeout_ms, args.post_llm_min_chars,
-            args.post_llm_cache_ttl_sec, args.post_llm_cache_max_entries,
             int(bool(args.post_llm_dynamic_max_tokens)), args.post_llm_output_token_factor,
             self.post_llm.reason,
         ))

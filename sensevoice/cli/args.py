@@ -382,18 +382,6 @@ def parse_args() -> argparse.Namespace:
         help="Skip LLM post-processing for too-short texts",
     )
     p.add_argument(
-        "--post-llm-cache-ttl-sec",
-        type=int,
-        default=int(os.environ.get("SENSEVOICE_POST_LLM_CACHE_TTL_SEC", "300")),
-        help="TTL for successful post-LLM result cache",
-    )
-    p.add_argument(
-        "--post-llm-cache-max-entries",
-        type=int,
-        default=int(os.environ.get("SENSEVOICE_POST_LLM_CACHE_MAX_ENTRIES", "120")),
-        help="Max entries for successful post-LLM result cache",
-    )
-    p.add_argument(
         "--post-llm-dynamic-max-tokens",
         type=int,
         choices=[0, 1],
