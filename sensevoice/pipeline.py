@@ -257,12 +257,6 @@ class SenseVoicePipeline:
         append_state_log(self.args.state_log, f"STREAM_STOP reason={reason}")
 
     def _setup_signals(self):
-        # 脱离父进程组，避免父 shell 退出时带走本进程
-        try:
-            os.setsid()
-        except OSError:
-            pass
-
         def _stop(_sig, _frame):
             self.stop_flag = True
 

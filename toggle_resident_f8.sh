@@ -304,9 +304,19 @@ case "$action" in
     exit 0
     ;;
   --on|on)
+    was_running=0
+    if is_running; then
+      was_running=1
+    fi
     if ! ensure_running; then
       notify_msg "ASR daemon start failed"
       exit 2
+    fi
+    # 冷启动时进程还在加载模型，不等 active（ACTIVE_ON_START=1 会自动激活）
+    if [[ "$was_running" == "0" ]]; then
+      log_toggle "CONTROL_ON cold_start"
+      notify_msg "ASR loading..."
+      exit 0
     fi
     if [[ "$(read_active)" == "1" ]]; then
       log_toggle "CONTROL_ON noop"
