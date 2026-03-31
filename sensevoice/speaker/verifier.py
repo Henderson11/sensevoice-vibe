@@ -96,9 +96,12 @@ class SpeakerVerifierGate:
             self._torch = torch
             self._F = F
 
-            # 优先使用 FunASR CAM++ 模型，回退到 SpeechBrain ECAPA-TDNN
-            use_funasr = "campplus" in (model_id or "").lower() or os.path.isfile(
-                os.path.join(model_id or "", "campplus_cn_common.bin")
+            # 使用 FunASR 模型（CAM++/ERes2NetV2），回退到 SpeechBrain ECAPA-TDNN
+            model_dir = model_id or ""
+            use_funasr = (
+                "campplus" in model_dir.lower()
+                or "eres2net" in model_dir.lower()
+                or os.path.isfile(os.path.join(model_dir, "config.yaml"))
             )
 
             if use_funasr:
