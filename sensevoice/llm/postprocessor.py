@@ -459,26 +459,11 @@ class LLMPostProcessor:
             return text
 
         out, err = self._request_once(self.model, src, prompt, req_max_tokens)
-        if not out and err == "timeout" and self.retry_on_timeout:
-            if self.retry_backoff_sec > 0:
-                time.sleep(self.retry_backoff_sec)
-            out_retry_to, err_retry_to = self._request_once(self.model, src, prompt, req_max_tokens)
-            if out_retry_to:
-                self._note_success()
-                return out_retry_to
-            err = f"timeout_retry:{err_retry_to or 'failed'}"
         if out:
             self._note_success()
             return out
-        if err == "model_not_found" and self.model_auto and self._autoselect_models():
-            out_retry, err_retry = self._request_once(self.model, src, prompt, req_max_tokens)
-            if out_retry:
-                self._note_success()
-                return out_retry
-            err = f"{err};reprobe:{err_retry or 'failed'}"
 
-        # Some providers/models return reasoning-only responses for thinking models.
-        # Fallback model keeps the chain usable for low-latency correction.
+        # 主模型失败（超时/错误）→ 立即切 fallback API，不重试
         if self.fallback_model:
             out2, err2 = self._request_once(
                 self.fallback_model, src, prompt, req_max_tokens,
