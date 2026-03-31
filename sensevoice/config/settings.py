@@ -74,60 +74,45 @@ class SenseVoiceConfig:
     @staticmethod
     def summary(args: argparse.Namespace) -> str:
         """生成配置摘要用于启动日志。"""
-        lines = [
-            "=== SenseVoice Configuration ===",
-            f"  model          : {getattr(args, 'model', '?')}",
-            f"  device         : {getattr(args, 'device', '?')}",
-            f"  language       : {getattr(args, 'language', '?')}",
-            f"  resident       : {getattr(args, 'resident', False)}",
-            f"  auto_enter     : {getattr(args, 'auto_enter', False)}",
-        ]
+        model_path = str(getattr(args, 'model', '?'))
+        # 只显示最后两级目录
+        model_short = "/".join(model_path.replace("\\", "/").split("/")[-2:]) if "/" in model_path else model_path
 
-        # VAD / stream timing
+        lines = ["=== SenseVoice 配置 ==="]
+
+        lines.append(f"  ASR 模型       : {model_short}")
+        lines.append(f"  语言           : {getattr(args, 'language', '?')}")
+
+        # 断句参数
         lines.append(
-            f"  stream         : frame={getattr(args, 'frame_ms', '?')}ms "
-            f"vad_agg={getattr(args, 'vad_aggressiveness', '?')} "
-            f"endpoint={getattr(args, 'endpoint_silence_ms', '?')}ms "
-            f"max_seg={getattr(args, 'max_segment_ms', '?')}ms"
+            f"  断句           : 停顿={getattr(args, 'endpoint_silence_ms', '?')}ms"
+            f" 最长={getattr(args, 'max_segment_ms', '?')}ms"
         )
 
-        # Speaker verification
+        # 声纹门禁
         spk = getattr(args, "speaker_verify", 0)
-        lines.append(
-            f"  speaker_verify : {'ON' if spk else 'off'}"
-            + (
-                f"  threshold={getattr(args, 'speaker_threshold', '?')}"
-                if spk else ""
-            )
-        )
+        if spk:
+            lines.append(f"  声纹门禁       : ON  阈值={getattr(args, 'speaker_threshold', '?')}")
+        else:
+            lines.append(f"  声纹门禁       : OFF")
 
-        # Post-LLM
+        # LLM 润色
         llm = getattr(args, "post_llm", 0)
-        lines.append(
-            f"  post_llm       : {'ON' if llm else 'off'}"
-            + (
-                f"  mode={getattr(args, 'post_llm_mode', '?')} "
-                f"model={getattr(args, 'post_llm_model', '?')}"
-                if llm else ""
-            )
-        )
+        if llm:
+            lines.append(f"  LLM 润色       : ON  模型={getattr(args, 'post_llm_model', '?')}")
+        else:
+            lines.append(f"  LLM 润色       : OFF")
 
-        # Confidence routing
+        # 置信度路由
         cr = getattr(args, "conf_route", 0)
-        lines.append(
-            f"  conf_route     : {'ON' if cr else 'off'}"
-            + (
-                f"  high={getattr(args, 'conf_high', '?')} "
-                f"low={getattr(args, 'conf_low', '?')}"
-                if cr else ""
-            )
-        )
+        if cr:
+            lines.append(f"  置信度路由     : ON  高={getattr(args, 'conf_high', '?')} 低={getattr(args, 'conf_low', '?')}")
+        else:
+            lines.append(f"  置信度路由     : OFF")
 
-        # Project lexicon
+        # 项目术语表
         lex = getattr(args, "project_lexicon", 0)
-        lines.append(
-            f"  project_lexicon: {'ON' if lex else 'off'}"
-        )
+        lines.append(f"  项目术语表     : {'ON' if lex else 'OFF'}")
 
-        lines.append("================================")
+        lines.append("========================")
         return "\n".join(lines)
