@@ -40,7 +40,7 @@ else
   echo "未检测到 GPU，安装 CPU 版 PyTorch..."
   "$ROOT_DIR/.venv/bin/pip" install -q torch torchaudio --index-url https://download.pytorch.org/whl/cpu
 fi
-"$ROOT_DIR/.venv/bin/pip" install -q funasr speechbrain webrtcvad-wheels soundfile openai
+"$ROOT_DIR/.venv/bin/pip" install -q funasr webrtcvad-wheels soundfile openai
 # 注册 ERes2NetV2 到 FunASR（FunASR 1.3.1 不原生支持）
 FUNASR_ERES2NET="$("$ROOT_DIR/.venv/bin/python" -c "import funasr, os; print(os.path.join(os.path.dirname(funasr.__file__), 'models', 'eres2net'))" 2>/dev/null)"
 if [[ -d "$FUNASR_ERES2NET" ]]; then

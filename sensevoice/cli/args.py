@@ -185,7 +185,7 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--speaker-model",
-        default=os.environ.get("SENSEVOICE_SPK_MODEL", "speechbrain/spkrec-ecapa-voxceleb"),
+        default=os.environ.get("SENSEVOICE_SPK_MODEL", "campplus"),
         help="Speaker verification model id",
     )
     p.add_argument(
