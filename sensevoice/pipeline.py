@@ -46,15 +46,16 @@ class SenseVoicePipeline:
         self.force_active: Optional[bool] = None
 
         # --- 组件（_init_components 中赋值，提前声明避免 finally 中 AttributeError）---
-        self.model = None
-        self.indicator = None
-        self.injector = None
-        self.speaker_gate = None
-        self.post_llm = None
-        self.project_lexicon = None
-        self.conf_router = None
-        self.vad = None
-        self.inject_mode_name = ""
+        from typing import Union
+        self.model: Optional[object] = None
+        self.indicator: Optional[SpeechIndicator] = None
+        self.injector: Optional[Union[IBusInjector, FocusInjector]] = None
+        self.speaker_gate: Optional[SpeakerVerifierGate] = None
+        self.post_llm: Optional[LLMPostProcessor] = None
+        self.project_lexicon: Optional[ProjectLexicon] = None
+        self.conf_router: Optional[ConfidenceRouter] = None
+        self.vad = None  # type: ignore[assignment]  # webrtcvad.Vad
+        self.inject_mode_name: str = ""
 
         # --- VAD 状态 ---
         self.frame_samples = int(args.sample_rate * args.frame_ms / 1000)
@@ -128,6 +129,7 @@ class SenseVoicePipeline:
             output_token_factor=args.post_llm_output_token_factor,
         )
         # 设置 fallback API 端点（内网不可用时降级到官方 API）
+        assert self.post_llm is not None
         self.post_llm.fallback_url = getattr(args, 'post_llm_fallback_base_url', '') or ''
         self.post_llm.fallback_api_key = getattr(args, 'post_llm_fallback_api_key', '') or ''
         if self.post_llm.fallback_url:
@@ -157,6 +159,10 @@ class SenseVoicePipeline:
 
     def _log_startup(self):
         """输出启动配置日志"""
+        assert self.speaker_gate is not None
+        assert self.post_llm is not None
+        assert self.project_lexicon is not None
+        assert self.conf_router is not None
         args = self.args
         log = args.state_log
 
@@ -211,6 +217,7 @@ class SenseVoicePipeline:
             f.write(f"updated={int(time.time())}\n")
 
     def inject(self, mode: str, text: str, critical: bool = False) -> bool:
+        assert self.injector is not None
         ok = self.injector.send(mode, text)
         if ok:
             return True
@@ -239,6 +246,7 @@ class SenseVoicePipeline:
         self.prev_partial_hyp = ""
 
     def start_capture(self):
+        assert self.indicator is not None
         if self.proc is not None:
             return
         self.proc = make_arecord_process(self.args)
@@ -252,7 +260,7 @@ class SenseVoicePipeline:
     def stop_capture(self, reason: str):
         if self.proc is None:
             return
-        if self.in_speech:
+        if self.in_speech and self.indicator:
             self.indicator.on_speech_end()
             append_state_log(self.args.state_log, "SPEECH_END")
         try:
@@ -268,8 +276,7 @@ class SenseVoicePipeline:
         append_state_log(self.args.state_log, f"STREAM_STOP reason={reason}")
 
     def _setup_signals(self):
-        def _stop(_sig, _frame):
-            import traceback
+        def _stop(_sig, _frame):  # noqa: ARG001
             sig_name = signal.Signals(_sig).name if hasattr(signal, 'Signals') else str(_sig)
             append_state_log(
                 self.args.state_log,
@@ -297,6 +304,11 @@ class SenseVoicePipeline:
 
     def _process_finalized_segment(self, samples: np.ndarray, seg_ms: float):
         """处理已结束的语音段：声纹 → ASR → LLM → 注入"""
+        assert self.speaker_gate is not None
+        assert self.post_llm is not None
+        assert self.project_lexicon is not None
+        assert self.conf_router is not None
+        assert self.injector is not None
         args = self.args
 
         compare_rec: Dict = {
@@ -443,6 +455,9 @@ class SenseVoicePipeline:
             append_state_log(args.state_log, f"CONFIG_WARN {w}", level="WARN")
 
         self._init_components()
+        assert self.indicator is not None
+        assert self.injector is not None
+        assert self.vad is not None
         self._log_startup()
         self.write_status(active=self.active, ready=False)
         self._setup_signals()
