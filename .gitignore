@@ -30,3 +30,4 @@ last_failed_inject.txt
 # OS
 .DS_Store
 Thumbs.db
+.diag/
