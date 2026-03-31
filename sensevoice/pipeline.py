@@ -166,46 +166,15 @@ class SenseVoicePipeline:
         args = self.args
         log = args.state_log
 
-        append_state_log(log, f"BOOT_BEGIN resident={int(args.resident)} active={int(self.active)}")
-        append_state_log(log, "WAKE_GATE enabled={} strategy={} strip={} words={}".format(
-            int(self.wake_enabled), args.wake_strategy, int(self.wake_strip),
-            "|".join(self.wake_words) if self.wake_words else "-",
-        ))
-        append_state_log(log, "SPK_GATE requested={} enabled={} threshold={} min_ms={} agg={} topk={} auto={} auto_min_score={} auto_min_ms={} auto_cd={} auto_max={} adapt={} aw={} amin={} afloor={} amargin={} prune={} pkeep={} reason={}".format(
-            int(bool(args.speaker_verify)), int(self.speaker_gate.enabled),
-            args.speaker_threshold, args.speaker_min_ms, args.speaker_score_agg,
-            args.speaker_score_topk, int(bool(args.speaker_auto_enroll)),
-            args.speaker_auto_enroll_min_score, args.speaker_auto_enroll_min_ms,
-            args.speaker_auto_enroll_cooldown_sec, args.speaker_auto_enroll_max_templates,
-            int(bool(args.speaker_adaptive)), args.speaker_adaptive_window,
-            args.speaker_adaptive_min_samples, args.speaker_adaptive_floor,
-            args.speaker_adaptive_margin, int(bool(args.speaker_prune_outliers)),
-            args.speaker_prune_keep, self.speaker_gate.reason,
-        ))
-        append_state_log(log, "POST_LLM requested={} enabled={} strict={} mode={} model={} fallback={} timeout_ms={} max_tokens={} temp={} max_fails={} cooldown_sec={} hard_cd={} retry_to={} retry_backoff_ms={} auto={} probe_ms={} min_chars={} dyn_tokens={} out_factor={} reason={}".format(
-            int(bool(args.post_llm)), int(self.post_llm.enabled), int(bool(args.post_llm_strict)),
-            args.post_llm_mode, self.post_llm.model or args.post_llm_model,
-            self.post_llm.fallback_model or args.post_llm_fallback_model or "-",
-            args.post_llm_timeout_ms, args.post_llm_max_tokens, args.post_llm_temperature,
-            args.post_llm_circuit_max_fails, args.post_llm_circuit_cooldown_sec,
-            args.post_llm_hard_cooldown_sec, int(bool(args.post_llm_retry_on_timeout)),
-            args.post_llm_retry_backoff_ms, int(bool(args.post_llm_model_auto)),
-            args.post_llm_model_probe_timeout_ms, args.post_llm_min_chars,
-            int(bool(args.post_llm_dynamic_max_tokens)), args.post_llm_output_token_factor,
-            self.post_llm.reason,
-        ))
-        append_state_log(log, "LEXICON requested={} enabled={} root={} terms={} hint_limit={} reason={}".format(
-            int(bool(args.project_lexicon)), int(self.project_lexicon.enabled),
-            self.project_lexicon.project_root or args.project_root,
-            len(self.project_lexicon.terms), args.project_lexicon_hint_limit,
-            self.project_lexicon.reason,
-        ))
-        append_state_log(log, "CONF_ROUTE enabled={} high={} low={}".format(
-            int(bool(args.conf_route)), self.conf_router.high, self.conf_router.low,
-        ))
-        append_state_log(log, "COMPARE_LOG enabled={} file={} keep_lines={}".format(
-            int(bool(args.compare_log)), args.compare_log_file, args.compare_log_keep_lines,
-        ))
+        # 简洁摘要（人类可读）
+        for line in SenseVoiceConfig.summary(args).split("\n"):
+            append_state_log(log, line)
+
+        # 关键组件状态（机器可解析）
+        append_state_log(log, f"SPK_GATE enabled={int(self.speaker_gate.enabled)} threshold={args.speaker_threshold} enroll_n={self.speaker_gate.enroll_count} reason={self.speaker_gate.reason}")
+        append_state_log(log, f"POST_LLM enabled={int(self.post_llm.enabled)} model={self.post_llm.model or '-'} fallback={self.post_llm.fallback_model or '-'} reason={self.post_llm.reason}")
+        append_state_log(log, f"LEXICON enabled={int(self.project_lexicon.enabled)} terms={len(self.project_lexicon.terms)} reason={self.project_lexicon.reason}")
+        append_state_log(log, f"CONF_ROUTE enabled={int(bool(args.conf_route))} high={self.conf_router.high} low={self.conf_router.low}")
 
     def write_status(self, active: bool, ready: bool, stopping: bool = False):
         with open(self.status_file, "w", encoding="utf-8") as f:
