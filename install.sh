@@ -41,6 +41,16 @@ else
   "$ROOT_DIR/.venv/bin/pip" install -q torch torchaudio --index-url https://download.pytorch.org/whl/cpu
 fi
 "$ROOT_DIR/.venv/bin/pip" install -q funasr speechbrain webrtcvad-wheels soundfile openai
+# 注册 ERes2NetV2 到 FunASR（FunASR 1.3.1 不原生支持）
+FUNASR_ERES2NET="$("$ROOT_DIR/.venv/bin/python" -c "import funasr, os; print(os.path.join(os.path.dirname(funasr.__file__), 'models', 'eres2net'))" 2>/dev/null)"
+if [[ -d "$FUNASR_ERES2NET" ]]; then
+  cp "$ROOT_DIR/sensevoice/speaker/funasr_patch/eres2netv2.py" "$FUNASR_ERES2NET/"
+  cp "$ROOT_DIR/sensevoice/speaker/funasr_patch/pooling_layers.py" "$FUNASR_ERES2NET/"
+  if ! grep -q "eres2netv2" "$FUNASR_ERES2NET/__init__.py" 2>/dev/null; then
+    echo "from funasr.models.eres2net.eres2netv2 import ERes2NetV2  # noqa" >> "$FUNASR_ERES2NET/__init__.py"
+  fi
+  echo "ERes2NetV2 声纹模型已注册到 FunASR ✓"
+fi
 echo "Python 依赖安装完成 ✓"
 
 # --- 3. 配置文件 ---
@@ -52,8 +62,8 @@ if [[ ! -f "$CONFIG_DIR/llm.env" ]]; then
   cp "$ROOT_DIR/config/llm.env.example" "$CONFIG_DIR/llm.env"
   # 自动填入模型路径
   sed -i "s|SENSEVOICE_MODEL=.*|SENSEVOICE_MODEL=$ROOT_DIR/models/sensevoice-small|" "$CONFIG_DIR/llm.env"
-  sed -i "s|SENSEVOICE_SPK_MODEL=.*|SENSEVOICE_SPK_MODEL=$ROOT_DIR/models/spkrec-ecapa|" "$CONFIG_DIR/llm.env"
-  sed -i "s|SENSEVOICE_SPK_CACHE_DIR=.*|SENSEVOICE_SPK_CACHE_DIR=$ROOT_DIR/models/spkrec-ecapa|" "$CONFIG_DIR/llm.env"
+  sed -i "s|SENSEVOICE_SPK_MODEL=.*|SENSEVOICE_SPK_MODEL=$ROOT_DIR/models/campplus|" "$CONFIG_DIR/llm.env"
+  sed -i "s|SENSEVOICE_SPK_CACHE_DIR=.*|SENSEVOICE_SPK_CACHE_DIR=$ROOT_DIR/models/campplus|" "$CONFIG_DIR/llm.env"
   sed -i "s|SENSEVOICE_PROJECT_ROOT=.*|SENSEVOICE_PROJECT_ROOT=$HOME|" "$CONFIG_DIR/llm.env"
   echo "配置文件已创建: $CONFIG_DIR/llm.env"
   echo "  ⚠ 请编辑填入 LLM API 密钥（如不使用 LLM 润色可跳过）"
