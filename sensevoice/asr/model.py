@@ -17,9 +17,22 @@ from sensevoice.asr.confidence import _aggregate_display_conf_scores
 from sensevoice.text.constants import EMOJI_ARTIFACTS
 
 
-def load_model(args: argparse.Namespace) -> AutoModel:
+def load_model(args: argparse.Namespace):
+    """加载 ASR 模型。优先使用 ONNX INT8（更快更小），回退到 PyTorch。"""
+    model_dir = args.model
+    use_onnx = getattr(args, "asr_onnx", False)
+
+    # 自动检测：如果模型目录下有 model_quant.onnx 且未显式禁用，使用 ONNX
+    import os
+    if not use_onnx and os.path.isfile(os.path.join(model_dir, "model_quant.onnx")):
+        use_onnx = True
+
+    if use_onnx:
+        from funasr_onnx import SenseVoiceSmall
+        return SenseVoiceSmall(model_dir, batch_size=1, quantize=True)
+
     return AutoModel(
-        model=args.model,
+        model=model_dir,
         trust_remote_code=False,
         device=args.device,
         disable_update=True,
@@ -157,29 +170,40 @@ def _native_ctc_confidence(
         return "", None, f"native_err:{type(e).__name__}", []
 
 
-def transcribe_array(model: AutoModel, samples: np.ndarray, language: str) -> str:
+def _is_onnx_model(model) -> bool:
+    return type(model).__name__ == "SenseVoiceSmall" and hasattr(model, "infer")
+
+
+def transcribe_array(model, samples: np.ndarray, language: str) -> str:
     if samples.size == 0:
         return ""
-    res = model.generate(
-        input=samples,
-        cache={},
-        language=language,
-        use_itn=True,
-        batch_size=1,
-        disable_pbar=True,
-        disable_log=True,
-    )
-    if res and isinstance(res, list) and isinstance(res[0], dict):
-        text = rich_transcription_postprocess(res[0].get("text", "")).strip()
-        return text.translate(str.maketrans("", "", EMOJI_ARTIFACTS)).strip()
-    return ""
+    if _is_onnx_model(model):
+        res = model(samples, language=language, textnorm="withitn")
+        if res and isinstance(res, list) and res[0]:
+            raw = res[0] if isinstance(res[0], str) else res[0].get("text", "")
+            text = rich_transcription_postprocess(raw).strip()
+            return text.translate(str.maketrans("", "", EMOJI_ARTIFACTS)).strip()
+        return ""
+    else:
+        res = model.generate(
+            input=samples, cache={}, language=language, use_itn=True,
+            batch_size=1, disable_pbar=True, disable_log=True,
+        )
+        if res and isinstance(res, list) and isinstance(res[0], dict):
+            text = rich_transcription_postprocess(res[0].get("text", "")).strip()
+            return text.translate(str.maketrans("", "", EMOJI_ARTIFACTS)).strip()
+        return ""
 
 
 def transcribe_array_with_conf(
-    model: AutoModel,
+    model,
     samples: np.ndarray,
     language: str,
 ) -> Tuple[str, Optional[float], str, List[Dict[str, float]]]:
+    # ONNX 模式下无法做 CTC 置信度计算，直接返回文本
+    if _is_onnx_model(model):
+        text = transcribe_array(model, samples, language)
+        return text, None, "onnx", []
     text, conf, source, token_scores = _native_ctc_confidence(model, samples, language)
     if text:
         return text, conf, source, token_scores
