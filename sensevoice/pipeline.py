@@ -296,20 +296,16 @@ class SenseVoicePipeline:
             signal.signal(signal.SIGHUP, _deactivate)
 
     def _process_finalized_segment(self, samples: np.ndarray, seg_ms: float):
-        """处理已结束的语音段：ASR → 声纹 → LLM → 注入"""
+        """处理已结束的语音段：声纹 → ASR → LLM → 注入"""
         args = self.args
-        raw_final_text, native_conf_score, conf_source, native_token_scores = transcribe_array_with_conf(
-            self.model, samples, args.language
-        )
-        final_text = sanitize_transcript_text(raw_final_text, args.language, bool(args.filter_fillers))
 
         compare_rec: Dict = {
             "ts": time.strftime("%F %T"), "seg_id": int(self.segment_id),
-            "seg_ms": int(seg_ms), "raw_asr": raw_final_text,
-            "after_sanitize": final_text, "spk_pass": None, "spk_score": None,
-            "spk_thr": None, "after_wake": None, "after_memory": None,
-            "conf_source": conf_source, "conf_native": native_conf_score,
-            "conf_tokens": native_token_scores, "conf_low_tokens": [],
+            "seg_ms": int(seg_ms), "raw_asr": "", "after_sanitize": "",
+            "spk_pass": None, "spk_score": None, "spk_thr": None,
+            "after_wake": None, "after_memory": None,
+            "conf_source": "", "conf_native": None,
+            "conf_tokens": [], "conf_low_tokens": [],
             "conf_score": None, "conf_route": None, "llm_action": "none",
             "after_llm": None, "after_lexicon": None,
             "final_injected": "", "inject_ok": 0, "drop_reason": "",
@@ -317,30 +313,47 @@ class SenseVoicePipeline:
         spk_score_for_conf: Optional[float] = None
         spk_thr_for_conf: Optional[float] = None
 
+        # 1. 先声纹验证——不通过则跳过 ASR，节省推理开销
+        spk_ok, spk_score, spk_reason, spk_thr = self.speaker_gate.verify(samples, args.sample_rate, seg_ms)
+        compare_rec["spk_pass"] = int(spk_ok)
+        compare_rec["spk_score"] = round(float(spk_score), 4)
+        compare_rec["spk_thr"] = round(float(spk_thr), 4)
+
+        if not spk_ok:
+            append_state_log(args.state_log, f"DROP_FINAL_SPK score={spk_score:.3f} thr={spk_thr:.3f} reason={spk_reason}")
+            compare_rec["drop_reason"] = f"spk:{spk_reason}"
+            if bool(args.compare_log):
+                append_jsonl_bounded(args.compare_log_file, compare_rec, keep_lines=args.compare_log_keep_lines)
+            return
+
+        # 声纹通过
+        if self.speaker_gate.requested and self.speaker_gate.enabled:
+            append_state_log(args.state_log, f"SPK_PASS score={spk_score:.3f} thr={spk_thr:.3f} reason={spk_reason}")
+            spk_score_for_conf = float(spk_score)
+            spk_thr_for_conf = float(spk_thr)
+            self.speaker_gate.on_success(spk_score, seg_ms, "")
+            added, add_info = self.speaker_gate.maybe_auto_enroll(samples, args.sample_rate, seg_ms, spk_score)
+            if added:
+                append_state_log(args.state_log, f"SPK_AUTO_ENROLL add={add_info} score={spk_score:.3f} n={self.speaker_gate.enroll_count}")
+            elif add_info not in ("auto_off", "score_low", "cooldown"):
+                append_state_log(args.state_log, f"SPK_AUTO_ENROLL_SKIP reason={add_info} score={spk_score:.3f} n={self.speaker_gate.enroll_count}")
+
+        # 2. ASR 识别（只有声纹通过才执行）
+        raw_final_text, native_conf_score, conf_source, native_token_scores = transcribe_array_with_conf(
+            self.model, samples, args.language
+        )
+        final_text = sanitize_transcript_text(raw_final_text, args.language, bool(args.filter_fillers))
+        compare_rec["raw_asr"] = raw_final_text
+        compare_rec["after_sanitize"] = final_text
+        compare_rec["conf_source"] = conf_source
+        compare_rec["conf_native"] = native_conf_score
+        compare_rec["conf_tokens"] = native_token_scores
+
         if raw_final_text and not final_text:
             append_state_log(args.state_log, f"DROP_FINAL raw={raw_final_text}")
             compare_rec["drop_reason"] = "sanitize_drop"
 
-        if final_text:
-            spk_ok, spk_score, spk_reason, spk_thr = self.speaker_gate.verify(samples, args.sample_rate, seg_ms)
-            compare_rec["spk_pass"] = int(spk_ok)
-            compare_rec["spk_score"] = round(float(spk_score), 4)
-            compare_rec["spk_thr"] = round(float(spk_thr), 4)
-            if not spk_ok:
-                append_state_log(args.state_log, f"DROP_FINAL_SPK score={spk_score:.3f} thr={spk_thr:.3f} reason={spk_reason} raw={final_text}")
-                compare_rec["drop_reason"] = f"spk:{spk_reason}"
-                final_text = ""
-            elif self.speaker_gate.requested and self.speaker_gate.enabled:
-                append_state_log(args.state_log, f"SPK_PASS score={spk_score:.3f} thr={spk_thr:.3f} reason={spk_reason}")
-                spk_score_for_conf = float(spk_score)
-                spk_thr_for_conf = float(spk_thr)
-                self.speaker_gate.on_success(spk_score, seg_ms, final_text)
-                added, add_info = self.speaker_gate.maybe_auto_enroll(samples, args.sample_rate, seg_ms, spk_score)
-                if added:
-                    append_state_log(args.state_log, f"SPK_AUTO_ENROLL add={add_info} score={spk_score:.3f} n={self.speaker_gate.enroll_count}")
-                elif add_info not in ("auto_off", "score_low", "cooldown"):
-                    append_state_log(args.state_log, f"SPK_AUTO_ENROLL_SKIP reason={add_info} score={spk_score:.3f} n={self.speaker_gate.enroll_count}")
-
+        # 3. 后续处理（唤醒词、LLM、注入）
         if final_text:
             if self.wake_enabled:
                 gated_final, matched_wake = gate_with_wake_words(final_text, self.wake_words, args.wake_strategy, self.wake_strip)
