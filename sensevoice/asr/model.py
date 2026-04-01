@@ -18,14 +18,21 @@ from sensevoice.text.constants import EMOJI_ARTIFACTS
 
 
 def load_model(args: argparse.Namespace):
-    """加载 ASR 模型。优先使用 ONNX INT8（更快更小），回退到 PyTorch。"""
-    model_dir = args.model
-    use_onnx = getattr(args, "asr_onnx", False)
-
-    # 自动检测：如果模型目录下有 model_quant.onnx 且未显式禁用，使用 ONNX
+    """加载 ASR 模型。根据 SENSEVOICE_ASR_BACKEND 配置选择推理后端。"""
     import os
-    if not use_onnx and os.path.isfile(os.path.join(model_dir, "model_quant.onnx")):
+    model_dir = args.model
+    backend = os.environ.get("SENSEVOICE_ASR_BACKEND", "auto").lower()
+
+    # auto: 有 ONNX 就用 ONNX，否则 PyTorch
+    # onnx: 强制 ONNX
+    # pytorch: 强制 PyTorch
+    use_onnx = False
+    if backend == "onnx":
         use_onnx = True
+    elif backend == "pytorch":
+        use_onnx = False
+    else:  # auto
+        use_onnx = os.path.isfile(os.path.join(model_dir, "model_quant.onnx"))
 
     if use_onnx:
         from funasr_onnx import SenseVoiceSmall
