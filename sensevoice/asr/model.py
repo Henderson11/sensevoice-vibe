@@ -4,6 +4,7 @@
 
 import argparse
 import itertools
+import os
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -24,8 +25,15 @@ def load_model(args: argparse.Namespace):
     backend = os.environ.get("SENSEVOICE_ASR_BACKEND", "auto").lower()
 
     # auto: 有 ONNX 就用 ONNX，否则 PyTorch
-    # onnx: 强制 ONNX
+    # onnx: 强制 ONNX INT8
     # pytorch: 强制 PyTorch
+    # qwen3asr: Qwen3-ASR C 引擎（antirez/qwen-asr）
+    if backend == "qwen3asr":
+        return Qwen3ASREngine(
+            executable=os.environ.get("SENSEVOICE_QWEN3ASR_BIN", "qwen_asr"),
+            model_dir=os.environ.get("SENSEVOICE_QWEN3ASR_MODEL", ""),
+        )
+
     use_onnx = False
     if backend == "onnx":
         use_onnx = True
@@ -45,6 +53,50 @@ def load_model(args: argparse.Namespace):
         disable_update=True,
         disable_log=True,
     )
+
+
+class Qwen3ASREngine:
+    """Qwen3-ASR C 引擎封装（antirez/qwen-asr）"""
+
+    def __init__(self, executable: str, model_dir: str):
+        self.executable = executable
+        self.model_dir = model_dir
+        self._tmpdir = None
+
+    def _ensure_tmpdir(self):
+        if self._tmpdir is None:
+            import tempfile
+            self._tmpdir = tempfile.mkdtemp(prefix="qwen3asr_")
+        return self._tmpdir
+
+    def transcribe_samples(self, samples: np.ndarray, sample_rate: int = 16000) -> str:
+        """将 numpy 音频写成临时 WAV，调用 C 引擎识别"""
+        import subprocess, wave, tempfile
+        tmpdir = self._ensure_tmpdir()
+        wav_path = os.path.join(tmpdir, "input.wav")
+
+        # 写 WAV
+        pcm = (np.clip(samples, -1.0, 1.0) * 32767).astype(np.int16)
+        with wave.open(wav_path, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(sample_rate)
+            wf.writeframes(pcm.tobytes())
+
+        # 调用 C 引擎
+        cmd = [self.executable]
+        if self.model_dir:
+            cmd.extend(["-d", self.model_dir])
+        cmd.extend(["-i", wav_path])
+
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            # 解析输出：C 引擎把识别文本直接输出到 stdout，最后一行是 Inference 统计
+            lines = result.stdout.strip().split("\n")
+            text_lines = [l for l in lines if not l.startswith("Loading ") and not l.startswith("Detected:") and not l.startswith("Inference:") and not l.startswith("Audio:")]
+            return " ".join(text_lines).strip()
+        except Exception:
+            return ""
 
 
 def _native_ctc_confidence(
@@ -181,9 +233,15 @@ def _is_onnx_model(model) -> bool:
     return type(model).__name__ == "SenseVoiceSmall" and hasattr(model, "infer")
 
 
+def _is_qwen3asr(model) -> bool:
+    return isinstance(model, Qwen3ASREngine)
+
+
 def transcribe_array(model, samples: np.ndarray, language: str) -> str:
     if samples.size == 0:
         return ""
+    if _is_qwen3asr(model):
+        return model.transcribe_samples(samples)
     if _is_onnx_model(model):
         res = model(samples, language=language, textnorm="withitn")
         if res and isinstance(res, list) and res[0]:
@@ -207,10 +265,11 @@ def transcribe_array_with_conf(
     samples: np.ndarray,
     language: str,
 ) -> Tuple[str, Optional[float], str, List[Dict[str, float]]]:
-    # ONNX 模式下无法做 CTC 置信度计算，直接返回文本
-    if _is_onnx_model(model):
+    # ONNX / Qwen3-ASR 模式下无法做 CTC 置信度计算，直接返回文本
+    if _is_onnx_model(model) or _is_qwen3asr(model):
         text = transcribe_array(model, samples, language)
-        return text, None, "onnx", []
+        source = "qwen3asr" if _is_qwen3asr(model) else "onnx"
+        return text, None, source, []
     text, conf, source, token_scores = _native_ctc_confidence(model, samples, language)
     if text:
         return text, conf, source, token_scores
