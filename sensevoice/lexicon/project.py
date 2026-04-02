@@ -63,6 +63,9 @@ class ProjectLexicon:
 
     @staticmethod
     def _is_source_file(path: str) -> bool:
+        base = os.path.basename(path)
+        if base.lower() in ("makefile", "cmakelists.txt"):
+            return True
         lower = path.lower()
         exts = (
             ".py",
@@ -84,10 +87,9 @@ class ProjectLexicon:
             ".yml",
             ".json",
             ".toml",
-            ".md",
-            ".txt",
             ".ini",
             ".cfg",
+            ".makefile",
         )
         return lower.endswith(exts)
 
@@ -105,17 +107,15 @@ class ProjectLexicon:
 
     def _collect_from_paths(self, counter: collections.Counter[str]) -> None:
         ignore_dirs = {
-            ".git",
-            ".venv",
-            ".mypy_cache",
-            "__pycache__",
-            "node_modules",
-            ".idea",
-            ".vscode",
-            "dist",
-            "build",
-            ".cache",
-            ".trash",
+            ".git", ".venv", "venv", "env",
+            ".mypy_cache", "__pycache__", ".pytest_cache",
+            "node_modules", "site-packages",
+            ".idea", ".vscode", ".claude",
+            "dist", "build", "egg-info",
+            ".cache", ".trash", ".tox",
+            "vendor", "third_party",
+            ".mosim", ".worktrees", ".diag",
+            "models", "logs",
         }
         max_files = 1800
         seen_files = 0
@@ -134,17 +134,15 @@ class ProjectLexicon:
 
     def _collect_from_files(self, counter: collections.Counter[str]) -> None:
         ignore_dirs = {
-            ".git",
-            ".venv",
-            ".mypy_cache",
-            "__pycache__",
-            "node_modules",
-            ".idea",
-            ".vscode",
-            "dist",
-            "build",
-            ".cache",
-            ".trash",
+            ".git", ".venv", "venv", "env",
+            ".mypy_cache", "__pycache__", ".pytest_cache",
+            "node_modules", "site-packages",
+            ".idea", ".vscode", ".claude",
+            "dist", "build", "egg-info",
+            ".cache", ".trash", ".tox",
+            "vendor", "third_party",
+            ".mosim", ".worktrees", ".diag",
+            "models", "logs",
         }
         max_files = 260
         max_bytes = 128 * 1024

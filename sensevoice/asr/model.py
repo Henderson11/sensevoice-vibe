@@ -27,7 +27,12 @@ def load_model(args: argparse.Namespace):
     # auto: 有 ONNX 就用 ONNX，否则 PyTorch
     # onnx: 强制 ONNX INT8
     # pytorch: 强制 PyTorch
-    # qwen3asr: Qwen3-ASR C 引擎（antirez/qwen-asr）
+    # qwen3asr: Qwen3-ASR C 引擎（antirez/qwen-asr，本地 CPU）
+    # qwen3asr-gpu: Qwen3-ASR GPU 服务（远程 HTTP API）
+    if backend == "qwen3asr-gpu":
+        return Qwen3ASRGPUClient(
+            url=os.environ.get("SENSEVOICE_QWEN3ASR_GPU_URL", "http://localhost:8866"),
+        )
     if backend == "qwen3asr":
         return Qwen3ASREngine(
             executable=os.environ.get("SENSEVOICE_QWEN3ASR_BIN", "qwen_asr"),
@@ -234,7 +239,7 @@ def _is_onnx_model(model) -> bool:
 
 
 def _is_qwen3asr(model) -> bool:
-    return isinstance(model, Qwen3ASREngine)
+    return isinstance(model, (Qwen3ASREngine, Qwen3ASRGPUClient))
 
 
 def transcribe_array(model, samples: np.ndarray, language: str) -> str:
@@ -274,3 +279,48 @@ def transcribe_array_with_conf(
     if text:
         return text, conf, source, token_scores
     return transcribe_array(model, samples, language), None, source, []
+
+
+class Qwen3ASRGPUClient:
+    """Qwen3-ASR GPU 推理客户端 — 通过 HTTP 调用远程 GPU 服务"""
+
+    def __init__(self, url: str):
+        self.url = url.rstrip("/")
+
+    def transcribe_samples(self, samples: np.ndarray, sample_rate: int = 16000) -> str:
+        import wave, tempfile, urllib.request, json
+
+        # 写临时 WAV
+        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        pcm = (np.clip(samples, -1.0, 1.0) * 32767).astype(np.int16)
+        with wave.open(tmp.name, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(sample_rate)
+            wf.writeframes(pcm.tobytes())
+
+        try:
+            # multipart/form-data 上传
+            boundary = "----SenseVoiceBoundary"
+            with open(tmp.name, "rb") as f:
+                wav_data = f.read()
+
+            body = (
+                f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="file"; filename="audio.wav"\r\n'
+                f"Content-Type: audio/wav\r\n\r\n"
+            ).encode() + wav_data + f"\r\n--{boundary}--\r\n".encode()
+
+            req = urllib.request.Request(
+                f"{self.url}/v1/audio/transcriptions",
+                data=body,
+                method="POST",
+                headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                result = json.loads(resp.read().decode())
+                return result.get("text", "")
+        except Exception:
+            return ""
+        finally:
+            os.unlink(tmp.name)
