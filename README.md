@@ -35,13 +35,13 @@
 
 - 🎤 **本地 ASR**：FunASR SenseVoice-Small（ONNX INT8 量化），单句推理 ~500ms
 - 🔐 **声纹门禁**：ERes2NetV2 验证发声者身份，仅注册声纹通过
-- 🧠 **LLM 后处理润色**：OpenAI 兼容 API（DeepSeek-V3.2 / GLM-5.1 / Qwen 等）修正错别字与标点，并保留项目专业术语
+- 🧠 **LLM 后处理润色**：OpenAI 兼容 API（DeepSeek-V3.2 / GLM-5.1 / Qwen 等）修正错别字与标点
 - 🛡 **熔断 + 缓存 + 双链路**：主 LLM 异常自动降级到 fallback，重复短语命中本地缓存
 - ⌨️ **IBus 原生注入**：通过 `commit_text` 协议直接写入焦点应用，剪贴板与键盘事件保持原样
 - 🔥 **F8 一键控制**：常驻进程持有模型，热键只切换录音状态
-- 📚 **项目术语表**：扫描代码目录提取标识符作为 ASR 热词（如 `FlashAttention`、`output_gen_pf` 保持原样输出）
 - 🔄 **配置漂移检测**：`llm.env` 修改后 F8 自动触发服务重启
 - 📊 **结构化日志**：VAD / 声纹 / ASR / LLM / 注入每阶段独立日志行，便于诊断
+- 🔌 **多 ASR 后端可切换**：通过 `SENSEVOICE_ASR_BACKEND` 切换 SenseVoice ONNX / SenseVoice PyTorch / Qwen3-ASR (实验性)
 
 ---
 
@@ -381,12 +381,18 @@ FINAL mode=...      ← 最终注入
 
 ## 🛣 路线图
 
-- [ ] 流式 ASR 输出（VAD 切完前就开始 partial 注入，缩短尾延迟）
-- [ ] Wayland 原生支持（当前依赖 IBus + X11/XWayland）
-- [ ] Web UI 实时监控（VAD 波形 / 置信度 / 模型状态）
-- [ ] 多人多声纹（家庭/团队场景，按声纹分用户）
-- [ ] 命令模式（识别"打开浏览器"等指令而非转文字）
-- [ ] macOS / Windows 移植
+### ASR 与术语注入
+- [ ] **Qwen3-ASR 原生热词注入**：当前 `SENSEVOICE_ASR_BACKEND=qwen3asr-gpu` 后端代码已就绪（`sensevoice/asr/model.py`），但 `Qwen3ASRGPUClient` 仅上传音频，未把热词列表透传给模型。需要扩展 HTTP 接口的 `hot_words` 参数，并把 ProjectLexicon 的词表对接进去
+- [ ] **项目术语表升级到 ASR 解码阶段**：当前 ProjectLexicon 仅作为 LLM 润色的 glossary 与事后模糊纠错，准确率有限；目标是改成 ASR 解码阶段直接注入热词（依赖 Qwen3-ASR 接入）
+- [ ] **ProjectLexicon 词表质量提升**：过滤通用 stopwords（self/args/text 等），加入命名空间感知（按导入图加权）
+- [ ] **流式 ASR 输出**：VAD 切完前开始 partial 注入，缩短尾延迟
+
+### 平台与体验
+- [ ] **Wayland 原生输入**：当前依赖 IBus + X11/XWayland
+- [ ] **Web UI 实时监控**：VAD 波形 / 置信度 / 模型状态
+- [ ] **多人多声纹**：家庭 / 团队场景按声纹区分用户
+- [ ] **命令模式**：识别"打开浏览器"等指令而非转文字
+- [ ] **macOS / Windows 移植**
 
 ---
 
