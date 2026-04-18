@@ -123,11 +123,12 @@ sudo apt-get update && sudo apt-get install -y \
     python3-venv python3-pip git \
     ibus ibus-gtk3 ibus-gtk4 \
     python3-gi gir1.2-ibus-1.0 \
-    portaudio19-dev libsndfile1 \
-    alsa-utils pulseaudio-utils
+    libsndfile1 alsa-utils pulseaudio-utils
 ```
 
 > ⚠️ `python3-gi` + `gir1.2-ibus-1.0` 是必需的——IBus engine 用 `/usr/bin/python3`（不是 venv）调 GObject Introspection。
+>
+> 不需要 `portaudio19-dev` / `pyaudio`——本项目用 `arecord` 直读 ALSA raw PCM。
 
 **验证**：
 ```bash
@@ -164,7 +165,7 @@ test -f download_models.sh && test -f setup.sh && test -d sensevoice/ && echo "O
 **验证**（setup.sh 末尾会自动跑这个，应全部 `ok`）：
 ```bash
 .venv/bin/python -c "
-import funasr, funasr_onnx, modelscope, huggingface_hub, webrtcvad, soundfile, torch
+import funasr, funasr_onnx, modelscope, huggingface_hub, webrtcvad, torch
 print('all imports OK')
 print('funasr', funasr.__version__, '/ torch', torch.__version__)
 "

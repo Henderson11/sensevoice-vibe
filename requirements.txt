@@ -20,7 +20,7 @@ torch==2.10.0+cpu
 torchaudio==2.10.0+cpu
 
 # === 音频处理 ===
-soundfile==0.13.1
+# soundfile 由 funasr 自动拉，不需显式列出（代码用 wave 标准库读 PCM）
 numpy>=2.0
 
 # === LLM 后处理（OpenAI 兼容协议）===

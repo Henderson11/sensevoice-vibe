@@ -31,11 +31,8 @@ echo "==> [3/4] 装其余 Python 依赖（requirements.txt）"
 # torch/torchaudio 已按上面专属 index 装好，过滤掉避免重装
 grep -vE "^(torch|torchaudio)==" "$REQ_FILE" \
   | "$VENV_DIR/bin/python" -m pip install -q -r /dev/stdin
-
-# ffmpeg 兜底（音频解码备用）
-"$VENV_DIR/bin/python" -m pip install -q imageio-ffmpeg
-FFMPEG_BIN="$("$VENV_DIR/bin/python" -c "import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())")"
-ln -sf "$FFMPEG_BIN" "$VENV_DIR/bin/ffmpeg"
+# 注：实时管线全程用 arecord 读 ALSA raw PCM（16kHz S16_LE），不解码任何音频文件，
+# 因此不需要 ffmpeg / imageio-ffmpeg。如果你要离线 transcribe mp3/m4a，自行 apt install ffmpeg。
 
 echo ""
 echo "==> [4/4] 注册 ERes2NetV2 到 FunASR（FunASR 1.3.1 不原生支持）"
@@ -58,7 +55,7 @@ echo "==> 验证关键 import"
 "$VENV_DIR/bin/python" - <<'PY'
 import importlib, sys
 mods = ["funasr", "funasr_onnx", "modelscope", "huggingface_hub",
-        "webrtcvad", "soundfile", "numpy", "torch", "torchaudio"]
+        "webrtcvad", "numpy", "torch", "torchaudio"]
 errs = []
 for m in mods:
     try:
