@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # 模型一键下载脚本
-# 优先 ModelScope（国内快），失败回退 HuggingFace
+# 用 ModelScope CLI 主拉，自动做 FunASR-ready 后处理
 #
 # 用法：
-#   ./download_models.sh              # 下载全部 3 个模型到 ./models/
-#   ./download_models.sh asr          # 仅下载 ASR 模型
-#   ./download_models.sh speaker      # 仅下载声纹模型（eres2netv2 + campplus）
+#   ./download_models.sh              # 下载全部 3 个模型
+#   ./download_models.sh asr          # 仅 ASR
+#   ./download_models.sh speaker      # 仅声纹（eres2netv2 + campplus）
 
 set -euo pipefail
 
@@ -19,99 +19,121 @@ fi
 
 mkdir -p "$MODELS_DIR"
 
-declare -A MODEL_MS=(
-  [asr]="iic/SenseVoiceSmall"
-  [speaker_eres2netv2]="iic/speech_eres2netv2_sv_zh-cn_16k-common"
-  [speaker_campplus]="iic/speech_campplus_sv_zh-cn_16k-common"
-)
+ms_download() {
+  local repo="$1" target="$2"
+  echo "  [pull] $repo  →  $target"
+  "$PYTHON_BIN" -m modelscope.cli.cli download --model "$repo" --local_dir "$target"
+}
 
-declare -A MODEL_HF=(
-  [asr]="FunAudioLLM/SenseVoiceSmall"
-  [speaker_eres2netv2]="alibaba-damo/speech_eres2netv2_sv_zh-cn_16k-common"
-  [speaker_campplus]="alibaba-damo/speech_campplus_sv_zh-cn_16k-common"
-)
-
-declare -A LOCAL_DIR=(
-  [asr]="$MODELS_DIR/sensevoice-small"
-  [speaker_eres2netv2]="$MODELS_DIR/eres2netv2"
-  [speaker_campplus]="$MODELS_DIR/campplus"
-)
-
-download_one() {
-  local key="$1"
-  local target="${LOCAL_DIR[$key]}"
-  local ms_repo="${MODEL_MS[$key]}"
-  local hf_repo="${MODEL_HF[$key]}"
-
-  if [[ -f "$target/configuration.json" ]] && \
-     { [[ -f "$target/model.pt" ]] || [[ -f "$target/model_quant.onnx" ]] || \
-       [[ -f "$target/campplus_cn_common.bin" ]]; }; then
-    echo "  [skip] $key 已存在: $target"
-    return 0
-  fi
-
-  echo "  [pull] $key from ModelScope ($ms_repo)"
-  if "$PYTHON_BIN" -c "
-import sys
-from modelscope.hub.snapshot_download import snapshot_download
-try:
-    p = snapshot_download(model_id='$ms_repo', cache_dir=r'$MODELS_DIR/.modelscope_cache')
-    import shutil, os
-    target = r'$target'
-    os.makedirs(target, exist_ok=True)
-    for f in os.listdir(p):
-        s = os.path.join(p, f); d = os.path.join(target, f)
-        if os.path.isfile(s) and not os.path.exists(d):
-            shutil.copy2(s, d)
-    print(f'  [ok] copied to {target}')
-except Exception as e:
-    print(f'  [ms-fail] {type(e).__name__}: {e}', file=sys.stderr)
-    sys.exit(1)
-" 2>&1; then
-    return 0
-  fi
-
-  echo "  [pull] $key from HuggingFace fallback ($hf_repo)"
+hf_download() {
+  local repo="$1" target="$2"
+  echo "  [pull] $repo from HuggingFace fallback  →  $target"
   if ! "$PYTHON_BIN" -c "import huggingface_hub" 2>/dev/null; then
     "$PYTHON_BIN" -m pip install -q huggingface_hub
   fi
-  "$PYTHON_BIN" -c "
+  HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}" \
+    "$PYTHON_BIN" -c "
+import os, sys
 from huggingface_hub import snapshot_download
-snapshot_download(repo_id='$hf_repo', local_dir=r'$target')
-print('  [ok] downloaded to $target')
+snapshot_download(repo_id='$repo', local_dir=r'$target')
+print('  [ok] hf done:', '$target')
 "
 }
 
+# ============ ASR (SenseVoice-Small) ============
+download_asr() {
+  local target="$MODELS_DIR/sensevoice-small"
+  if [[ -f "$target/model.pt" && -f "$target/configuration.json" ]]; then
+    echo "  [skip] ASR 已就绪: $target"
+    return 0
+  fi
+  echo "==> 下载 ASR (SenseVoice-Small, ~1.1GB)"
+  if ms_download "iic/SenseVoiceSmall" "$target"; then
+    : # ModelScope 文件名已经是 model.pt + configuration.json，无需后处理
+  else
+    hf_download "FunAudioLLM/SenseVoiceSmall" "$target"
+  fi
+}
+
+# ============ 声纹 ERes2NetV2 ============
+download_eres2netv2() {
+  local target="$MODELS_DIR/eres2netv2"
+  if [[ -f "$target/model.pt" && -f "$target/config.yaml" ]]; then
+    echo "  [skip] ERes2NetV2 已就绪: $target"
+    return 0
+  fi
+  echo "==> 下载声纹 ERes2NetV2 (~70MB)"
+  ms_download "iic/speech_eres2netv2_sv_zh-cn_16k-common" "$target"
+
+  # === FunASR-ready 后处理 ===
+  # ModelScope 下来文件名是 pretrained_eres2netv2.ckpt + 自家 configuration.json
+  # FunASR 期望: model.pt + funasr 风格 config.yaml + configuration.json
+  if [[ -f "$target/pretrained_eres2netv2.ckpt" && ! -f "$target/model.pt" ]]; then
+    echo "  [post] 重命名 pretrained_eres2netv2.ckpt → model.pt"
+    mv "$target/pretrained_eres2netv2.ckpt" "$target/model.pt"
+  fi
+  echo "  [post] 写 FunASR-ready config.yaml + configuration.json"
+  cat > "$target/config.yaml" <<'YAML'
+model: ERes2NetV2
+model_conf:
+    feat_dim: 80
+    embedding_size: 192
+    m_channels: 64
+    baseWidth: 26
+    scale: 2
+    expansion: 2
+    pooling_func: TSTP
+    two_emb_layer: false
+
+frontend: WavFrontend
+frontend_conf:
+    fs: 16000
+YAML
+  cat > "$target/configuration.json" <<'JSON'
+{
+    "framework": "pytorch",
+    "task": "speaker-verification",
+    "model": {"type": "funasr"},
+    "file_path_metas": {
+        "init_param": "model.pt",
+        "config": "config.yaml"
+    }
+}
+JSON
+}
+
+# ============ 声纹 CAM++（备用）============
+download_campplus() {
+  local target="$MODELS_DIR/campplus"
+  if [[ -f "$target/campplus_cn_common.bin" && -f "$target/configuration.json" ]]; then
+    echo "  [skip] CAM++ 已就绪: $target"
+    return 0
+  fi
+  echo "==> 下载声纹 CAM++ (~28MB, 备用)"
+  ms_download "iic/speech_campplus_sv_zh-cn_16k-common" "$target"
+}
+
 case "${1:-all}" in
-  asr)
-    download_one asr ;;
-  speaker)
-    download_one speaker_eres2netv2
-    download_one speaker_campplus ;;
-  all|"")
-    echo "==> 下载 ASR 模型 (SenseVoice-Small, ~1.1GB)"
-    download_one asr
-    echo ""
-    echo "==> 下载声纹模型 (ERes2NetV2, ~70MB)"
-    download_one speaker_eres2netv2
-    echo ""
-    echo "==> 下载声纹模型 (CAM++, ~28MB, 备用)"
-    download_one speaker_campplus ;;
-  *)
-    echo "用法: $0 [all|asr|speaker]" >&2
-    exit 1 ;;
+  asr) download_asr ;;
+  speaker) download_eres2netv2; download_campplus ;;
+  all|"") download_asr; download_eres2netv2; download_campplus ;;
+  *) echo "用法: $0 [all|asr|speaker]" >&2; exit 1 ;;
 esac
 
 echo ""
-echo "==> 验证模型文件"
-for key in asr speaker_eres2netv2 speaker_campplus; do
-  d="${LOCAL_DIR[$key]}"
-  if [[ -d "$d" ]]; then
-    sz=$(du -sh "$d" | awk '{print $1}')
-    n=$(find "$d" -maxdepth 1 -type f | wc -l)
-    echo "  [ok] $key  size=$sz  files=$n  path=$d"
+echo "==> 验证模型"
+err=0
+for d in "$MODELS_DIR/sensevoice-small/model.pt" \
+         "$MODELS_DIR/eres2netv2/model.pt" \
+         "$MODELS_DIR/eres2netv2/config.yaml" \
+         "$MODELS_DIR/campplus/campplus_cn_common.bin"; do
+  if [[ -f "$d" ]]; then
+    sz=$(du -h "$d" | awk '{print $1}')
+    echo "  [ok] $sz  $d"
+  else
+    echo "  [MISSING] $d"
+    err=1
   fi
 done
-
-echo ""
-echo "全部模型就绪，可继续: ./setup.sh"
+[[ "$err" == "0" ]] && echo "" && echo "模型就绪，可继续: ./setup.sh"
+exit "$err"
