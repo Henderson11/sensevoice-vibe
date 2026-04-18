@@ -31,7 +31,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--endpoint-silence-ms",
         type=int,
-        default=int(os.environ.get("SENSEVOICE_STREAM_ENDPOINT_MS", "650")),
+        default=int(os.environ.get("SENSEVOICE_STREAM_ENDPOINT_MS", "1500")),
     )
     p.add_argument(
         "--max-segment-ms",
@@ -46,7 +46,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--min-segment-ms",
         type=int,
-        default=int(os.environ.get("SENSEVOICE_STREAM_MIN_SEGMENT_MS", "850")),
+        default=int(os.environ.get("SENSEVOICE_STREAM_MIN_SEGMENT_MS", "400")),
     )
     p.add_argument(
         "--partial-interval-ms",

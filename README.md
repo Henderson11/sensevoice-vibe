@@ -70,13 +70,103 @@ F8 快捷键和 toggle 脚本均从此文件读取，修改后重启服务即可
 | 配置 | 说明 | 默认值 |
 |------|------|--------|
 | `SENSEVOICE_INJECT_MODE` | 注入模式 (ibus/clipboard) | ibus |
-| `SENSEVOICE_STREAM_ENDPOINT_MS` | 停顿断句阈值 (ms) | 900 |
+| `SENSEVOICE_STREAM_ENDPOINT_MS` | 停顿断句阈值 (ms) | 1500 |
 | `SENSEVOICE_STREAM_MAX_SEGMENT_MS` | 单段最大时长 (ms) | 20000 |
 | `SENSEVOICE_SPK_ENABLE` | 声纹门禁开关 | 1 |
 | `SENSEVOICE_SPK_THRESHOLD` | 声纹相似度阈值 | 0.45 |
 | `SENSEVOICE_POST_LLM_ENABLE` | LLM 润色开关 | 1 |
 | `SENSEVOICE_POST_LLM_MODEL` | 润色模型 | DeepSeek-V3.2 |
 | `SENSEVOICE_LANGUAGE` | 识别语言 (auto/zh/en) | auto |
+
+## LLM 后处理润色配置
+
+ASR 输出会经过一次 LLM 润色（修错别字、补标点、规范术语），由 OpenAI 兼容协议调用。**强烈推荐使用内网 GPU 代理服务**（DeepSeek-V3.2 / GLM-4.5 等），延迟稳定、不走公网、不受外部限流影响。
+
+### 推荐方案：内网 SpiritX 代理
+
+在 `~/.config/sensevoice-vibe/llm.env` 中填入：
+
+```bash
+# === 主链路：内网代理 ===
+SENSEVOICE_POST_LLM_ENABLE=1
+SENSEVOICE_POST_LLM_BASE_URL=http://<INTERNAL_LLM_HOST>:31091/<YOUR_LLM_PROXY_PATH>/v1
+SENSEVOICE_POST_LLM_API_KEY=sk-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX   # 向管理员申请
+SENSEVOICE_POST_LLM_MODEL=DeepSeek-V3.2                            # 当前推荐
+# 可选模型：DeepSeek-V3.2 / GLM-4.5 / Qwen2.5-72B-Instruct ...
+# 用 curl $BASE_URL/models 列出全部可用 model id
+
+# === 降级链路：公网官方 API（内网故障时自动切换）===
+SENSEVOICE_POST_LLM_FALLBACK_BASE_URL=https://api.deepseek.com/v1
+SENSEVOICE_POST_LLM_FALLBACK_API_KEY=sk-YYYYYYYYYYYYYYYYYYYYYYYY
+SENSEVOICE_POST_LLM_FALLBACK_MODEL=deepseek-chat
+
+# === 润色行为 ===
+SENSEVOICE_POST_LLM_MODE=polish_coding_aggressive   # 编程语境强润色（修术语+补标点）
+                                                    # 可选：polish_coding（保守）/ polish（通用）
+SENSEVOICE_POST_LLM_TIMEOUT_MS=1800                 # 单次调用超时
+SENSEVOICE_POST_LLM_MAX_TOKENS=72                   # 输出上限（短句够用，避免 LLM 长篇大论）
+SENSEVOICE_POST_LLM_TEMPERATURE=0                   # 确定性输出
+SENSEVOICE_POST_LLM_MIN_CHARS=5                     # 短于 5 字直接跳过润色
+```
+
+### 验证内网链路
+
+```bash
+# 1. 列出代理可用的全部模型
+curl -s -H "Authorization: Bearer $SENSEVOICE_POST_LLM_API_KEY" \
+     http://<INTERNAL_LLM_HOST>:31091/<YOUR_LLM_PROXY_PATH>/v1/models | python3 -m json.tool
+
+# 2. 测试一次 chat completion
+curl -s http://<INTERNAL_LLM_HOST>:31091/<YOUR_LLM_PROXY_PATH>/v1/chat/completions \
+     -H "Authorization: Bearer $SENSEVOICE_POST_LLM_API_KEY" \
+     -H "Content-Type: application/json" \
+     -d '{"model":"DeepSeek-V3.2","messages":[{"role":"user","content":"hello"}]}'
+```
+
+### 置信度路由（节省 LLM 调用）
+
+ASR 置信度高时跳过润色，只在低置信度时调用 LLM：
+
+| 配置 | 说明 | 默认 |
+|------|------|------|
+| `SENSEVOICE_CONF_ROUTE_ENABLE` | 路由开关 | 1 |
+| `SENSEVOICE_CONF_ROUTE_HIGH` | ≥ 此分数走 high 路（`polish_coding_aggressive` 仍会润色，其他模式跳过） | 0.42 |
+| `SENSEVOICE_CONF_ROUTE_LOW` | ≤ 此分数 LLM 强制改写 | 0.30 |
+
+### 熔断与重试
+
+内网瞬时故障时自动熔断、过冷却期再恢复，避免拖累整条管线：
+
+| 配置 | 说明 | 默认 |
+|------|------|------|
+| `SENSEVOICE_POST_LLM_CIRCUIT_MAX_FAILS` | 连续失败几次进入熔断 | 4 |
+| `SENSEVOICE_POST_LLM_CIRCUIT_COOLDOWN_SEC` | 熔断后冷却时长（秒） | 25 |
+| `SENSEVOICE_POST_LLM_HARD_COOLDOWN_SEC` | 重大故障的硬冷却 | 300 |
+| `SENSEVOICE_POST_LLM_RETRY_ON_TIMEOUT` | 超时是否重试一次 | 1 |
+| `SENSEVOICE_POST_LLM_CACHE_TTL_SEC` | 同句缓存 TTL（重复说同一句直接命中缓存）| 300 |
+
+### 观察 LLM 链路是否工作
+
+```bash
+tail -f ~/.local/state/sensevoice-vibe/stream_vad.log | grep -E "POST_LLM"
+# POST_LLM_APPLY: LLM 改写了文本（src=原 dst=改）
+# POST_LLM_PASS:  LLM 看过觉得没问题，原样输出
+# POST_LLM_SKIP:  跳过（高置信度路由 / 熔断 / 文本过短）
+```
+
+启动时还会打印一行汇总：
+```
+POST_LLM enabled=1 model=DeepSeek-V3.2 fallback=deepseek-chat reason=ready:...
+```
+
+### 修改配置后如何生效
+
+```bash
+./toggle_resident_f8.sh restart   # 显式重启（推荐）
+# 或：直接按 F8（脚本会自动检测 llm.env 比进程新，自动重启）
+```
+
+> ⚠️ **不要**简单地按 F8 关再开就以为生效了——F8 的 on/off 默认只切换录音状态，不重启进程。如果 `llm.env` 没动则保持 active 切换语义；如果 `llm.env` 改过了脚本会自动走 restart 路径。
 
 ## 使用
 

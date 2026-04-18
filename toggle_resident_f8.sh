@@ -81,6 +81,41 @@ is_running() {
   kill -0 "$pid" 2>/dev/null
 }
 
+# 若 llm.env 比当前运行的进程更新，说明有待生效的配置漂移
+env_newer_than_proc() {
+  local pid="$1"
+  local env_file="$HOME/.config/sensevoice-vibe/llm.env"
+  [[ -n "$pid" ]] || return 1
+  [[ -f "$env_file" ]] || return 1
+  [[ -d "/proc/$pid" ]] || return 1
+  local env_mtime proc_start
+  env_mtime=$(stat -c %Y "$env_file" 2>/dev/null) || return 1
+  proc_start=$(stat -c %Y "/proc/$pid" 2>/dev/null) || return 1
+  (( env_mtime > proc_start ))
+}
+
+stop_daemon() {
+  local pid
+  pid="$(daemon_pid)"
+  [[ -n "$pid" ]] || return 0
+  kill "$pid" 2>/dev/null || true
+  for _ in $(seq 1 50); do
+    kill -0 "$pid" 2>/dev/null || return 0
+    sleep 0.1
+  done
+  kill -9 "$pid" 2>/dev/null || true
+  for _ in $(seq 1 20); do
+    kill -0 "$pid" 2>/dev/null || return 0
+    sleep 0.1
+  done
+  return 1
+}
+
+restart_daemon() {
+  stop_daemon || return 1
+  ensure_running
+}
+
 start_daemon() {
   [[ -x "$VENV_DIR/bin/python" ]] || exit 2
   local llm_env_file="$HOME/.config/sensevoice-vibe/llm.env"
@@ -137,13 +172,13 @@ start_daemon() {
     SENSEVOICE_DEBUG_INJECT="${SENSEVOICE_DEBUG_INJECT:-1}" \
     SENSEVOICE_CLEAR_BEFORE_REPLACE="${SENSEVOICE_CLEAR_BEFORE_REPLACE:-0}" \
     SENSEVOICE_STREAM_INDICATOR="${SENSEVOICE_STREAM_INDICATOR:-none}" \
-    SENSEVOICE_STREAM_VAD_AGGRESSIVENESS="${SENSEVOICE_STREAM_VAD_AGGRESSIVENESS:-3}" \
+    SENSEVOICE_STREAM_VAD_AGGRESSIVENESS="${SENSEVOICE_STREAM_VAD_AGGRESSIVENESS:-2}" \
     SENSEVOICE_STREAM_START_MS="${SENSEVOICE_STREAM_START_MS:-240}" \
     SENSEVOICE_STREAM_FRAME_MS="${SENSEVOICE_STREAM_FRAME_MS:-20}" \
     SENSEVOICE_STREAM_PRE_ROLL_MS="${SENSEVOICE_STREAM_PRE_ROLL_MS:-700}" \
-    SENSEVOICE_STREAM_ENDPOINT_MS="${SENSEVOICE_STREAM_ENDPOINT_MS:-1200}" \
+    SENSEVOICE_STREAM_ENDPOINT_MS="${SENSEVOICE_STREAM_ENDPOINT_MS:-1500}" \
     SENSEVOICE_STREAM_MAX_SEGMENT_MS="${SENSEVOICE_STREAM_MAX_SEGMENT_MS:-30000}" \
-    SENSEVOICE_STREAM_MIN_SEGMENT_MS="${SENSEVOICE_STREAM_MIN_SEGMENT_MS:-850}" \
+    SENSEVOICE_STREAM_MIN_SEGMENT_MS="${SENSEVOICE_STREAM_MIN_SEGMENT_MS:-400}" \
     SENSEVOICE_STREAM_PARTIAL_INTERVAL_MS="${SENSEVOICE_STREAM_PARTIAL_INTERVAL_MS:-280}" \
     SENSEVOICE_STREAM_MIN_PARTIAL_MS="${SENSEVOICE_STREAM_MIN_PARTIAL_MS:-1300}" \
     SENSEVOICE_RETENTION_KEEP_RECENT="${SENSEVOICE_RETENTION_KEEP_RECENT:-20}" \
@@ -191,7 +226,7 @@ start_daemon() {
     --resident \
     --language "${SENSEVOICE_LANGUAGE:-auto}" \
     --indicator "${SENSEVOICE_STREAM_INDICATOR:-none}" \
-    >>"$DAEMON_LOG" 2>&1 </dev/null &
+    >>"$DAEMON_LOG" 2>&1 </dev/null 9<&- &
   local pid=$!
   disown "$pid" 2>/dev/null || true
   echo "$pid" >"$PID_FILE"
@@ -307,6 +342,18 @@ case "$action" in
     was_running=0
     if is_running; then
       was_running=1
+      # 配置已漂移则自动重启，不然 env 新改的参数永远吃不到
+      if env_newer_than_proc "$(daemon_pid)"; then
+        log_toggle "CONFIG_DRIFT auto_restart"
+        notify_msg "Config updated, restarting..."
+        if restart_daemon; then
+          log_toggle "CONTROL_ON cold_start_after_restart"
+          exit 0
+        else
+          notify_msg "ASR restart failed"
+          exit 2
+        fi
+      fi
     fi
     if ! ensure_running; then
       notify_msg "ASR daemon start failed"
@@ -345,10 +392,32 @@ case "$action" in
       fi
     fi
     ;;
+  --restart|restart)
+    if restart_daemon; then
+      log_toggle "CONTROL_RESTART ok"
+      notify_msg "ASR restarted"
+      exit 0
+    else
+      log_toggle "CONTROL_RESTART failed"
+      notify_msg "ASR restart failed"
+      exit 2
+    fi
+    ;;
   --toggle|toggle|"")
     was_running=0
     if is_running; then
       was_running=1
+      if env_newer_than_proc "$(daemon_pid)"; then
+        log_toggle "CONFIG_DRIFT auto_restart"
+        notify_msg "Config updated, restarting..."
+        if restart_daemon; then
+          log_toggle "CONTROL_TOGGLE cold_start_after_restart"
+          exit 0
+        else
+          notify_msg "ASR restart failed"
+          exit 2
+        fi
+      fi
     fi
     if ! ensure_running; then
       notify_msg "ASR daemon start failed"
