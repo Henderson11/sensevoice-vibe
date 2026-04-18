@@ -19,3 +19,4 @@ numpy>=2.0
 
 # LLM 后处理 (OpenAI 兼容 API)
 openai>=1.0
+modelscope>=1.34.0  # 模型下载

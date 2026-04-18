@@ -10,8 +10,8 @@ __pycache__/
 *.lock
 *.sock
 
-# 模型文件由 Git LFS 管理，不在 .gitignore 中排除
-# *.pt *.ckpt 等已通过 .gitattributes 配置 LFS 跟踪
+# 模型文件不入仓，由 download_models.sh 从 ModelScope / HuggingFace 拉取
+models/
 
 # 配置（含密钥，用模板替代）
 llm.env

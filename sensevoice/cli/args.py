@@ -36,7 +36,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--max-segment-ms",
         type=int,
-        default=int(os.environ.get("SENSEVOICE_STREAM_MAX_SEGMENT_MS", "8000")),
+        default=int(os.environ.get("SENSEVOICE_STREAM_MAX_SEGMENT_MS", "30000")),
     )
     p.add_argument(
         "--pre-roll-ms",

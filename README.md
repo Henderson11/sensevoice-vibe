@@ -1,311 +1,431 @@
-# SenseVoice 语音输入系统
+<div align="center">
 
-基于 FunASR SenseVoice 的实时语音输入系统，支持 IBus 直接注入、LLM 后处理润色、声纹门禁。
+# 🎤 SenseVoice Vibe
 
-## 架构
+**给 Linux 程序员的本地语音输入系统 — 按 F8 开口说，文字直接出现在光标处**
 
-```
-麦克风 → VAD(webrtcvad) → ASR(SenseVoice) → 声纹验证(ECAPA-TDNN)
-  → 置信度路由 → LLM润色(DeepSeek) → IBus commit_text → 输入框
-```
+[![Python](https://img.shields.io/badge/Python-3.10+-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![ASR](https://img.shields.io/badge/ASR-SenseVoice--Small-FF6B6B)](https://www.modelscope.cn/models/iic/SenseVoiceSmall)
+[![Speaker](https://img.shields.io/badge/Speaker-ERes2NetV2-4ECDC4)](https://www.modelscope.cn/models/iic/speech_eres2netv2_sv_zh-cn_16k-common)
+[![Platform](https://img.shields.io/badge/Platform-Linux--IBus-FCC419?logo=linux&logoColor=black)](https://github.com/ibus/ibus)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/Henderson11/sensevoice-vibe/pulls)
 
-## 模块结构
+**[特性](#-特性) · [60 秒上手](#-60-秒上手) · [完整安装](#-完整安装-runbook) · [配置](#-配置) · [故障排查](#-故障排查) · [架构](#-架构)**
 
-```
-├── stream_vad_realtime.py          # 核心管线：VAD + ASR + 声纹 + LLM后处理
-├── ibus-sensevoice/                # IBus 注入引擎
-│   ├── sensevoice_engine.py        #   socket → commit_text
-│   ├── sensevoice-voice.xml        #   IBus 组件注册
-│   └── test_inject.py              #   注入测试
-├── toggle_resident_f8.sh           # F8 热键控制（常驻进程 + 信号切换）
-├── configure_f8.sh                 # GNOME 快捷键配置
-├── enroll_speaker_f8.sh            # 声纹模板采集
-├── send_to_focus_ydotool.sh        # 剪贴板注入后端（兼容模式）
-├── install_ibus_engine.sh          # IBus 引擎安装
-├── install_autostart_service.sh    # systemd 自启服务安装
-├── config/
-│   ├── llm.env.example             # 配置模板（不含密钥）
-│   └── sensevoice-vibe.service.example  # systemd 服务模板
-├── hotwords_coding_zh.txt          # 编程术语热词表
-└── requirements.txt                # Python 依赖
-```
-
-## 安装
-
-```bash
-# 1. 创建虚拟环境并安装依赖
-./setup.sh
-# 或手动：
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
-
-# 2. 下载 ASR 模型（首次自动下载到 ~/.cache/modelscope/）
-# 或手动指定本地路径
-
-# 3. 安装 IBus 引擎（ibus 注入模式需要）
-./install_ibus_engine.sh
-
-# 4. 复制配置文件并填入 API 密钥
-cp config/llm.env.example ~/.config/sensevoice-vibe/llm.env
-# 编辑 llm.env 填入 POST_LLM_BASE_URL 和 API_KEY
-
-# 5. 配置 F8 快捷键
-./configure_f8.sh
-
-# 6.（可选）采集声纹模板
-./enroll_speaker_f8.sh
-
-# 7.（可选）安装开机自启服务
-./install_autostart_service.sh
-```
-
-## 配置
-
-**所有配置集中在一个文件：`~/.config/sensevoice-vibe/llm.env`**
-
-F8 快捷键和 toggle 脚本均从此文件读取，修改后重启服务即可生效。
-
-关键配置项：
-
-| 配置 | 说明 | 默认值 |
-|------|------|--------|
-| `SENSEVOICE_INJECT_MODE` | 注入模式 (ibus/clipboard) | ibus |
-| `SENSEVOICE_STREAM_ENDPOINT_MS` | 停顿断句阈值 (ms) | 1500 |
-| `SENSEVOICE_STREAM_MAX_SEGMENT_MS` | 单段最大时长 (ms) | 20000 |
-| `SENSEVOICE_SPK_ENABLE` | 声纹门禁开关 | 1 |
-| `SENSEVOICE_SPK_THRESHOLD` | 声纹相似度阈值 | 0.45 |
-| `SENSEVOICE_POST_LLM_ENABLE` | LLM 润色开关 | 1 |
-| `SENSEVOICE_POST_LLM_MODEL` | 润色模型 | DeepSeek-V3.2 |
-| `SENSEVOICE_LANGUAGE` | 识别语言 (auto/zh/en) | auto |
-
-## LLM 后处理润色配置（内网 GPU 代理 - 部署 Runbook）
-
-> 本节是给 **AI Agent 或新用户**的可执行部署手册。按顺序执行下面 6 步，每步都有验证命令和期望输出。任何一步验证失败立即停止，不要继续往下走。
-
-ASR 输出会经过一次 LLM 润色（修错别字、补标点、规范术语），由 OpenAI 兼容协议调用。本节配置的是**内网 SpiritX 代理**（DeepSeek-V3.2 / GLM-5.1-FP8），并用公网 DeepSeek 官方 API 作为 fallback。
-
-### 前置条件
-
-- 已经按上节"安装"完成 1~3 步（venv、ASR 模型、IBus 引擎）
-- 能访问内网 `<INTERNAL_LLM_HOST>:31091`（公司内网或 VPN 已连接）
-- 已经从管理员处拿到 SpiritX 代理的 API key（`sk-` 开头）和 DeepSeek 官方 API key
+</div>
 
 ---
 
-### Step 1：创建配置目录
+## 💡 这是什么
+
+写代码 / 写文档 / 写消息时，敲键盘累。这个项目让你：
+
+> **按一下 F8 → 对着麦克风说话 → 屏幕里的光标处直接出现文字**
+
+跟一般"语音转文字"工具的差别：
+
+| | 一般方案 | **SenseVoice Vibe** |
+|---|---|---|
+| **识别引擎** | 走云 API（百度/讯飞/Azure） | **本地 ASR**（SenseVoice INT8，~500ms/句） |
+| **隐私** | 音频上传服务器 | **音频不出本机** |
+| **旁人说话** | 全部识别注入 | **声纹门禁** — 只识别你自己 |
+| **错别字** | 写错就错 | **LLM 润色**（DeepSeek/GLM/Qwen，可换） |
+| **注入方式** | 复制粘贴（污染剪贴板） | **IBus commit_text** — 直接发到光标 |
+| **热词** | 手工维护 | **自动从你代码目录提取**编程术语 |
+| **专业术语** | "组网" | **"整网"**（你项目的固有词被保留） |
+
+适合：在 Linux 写代码的人、信息安全要求高的场景、不愿意每月花钱订阅云 ASR 的人。
+
+---
+
+## ✨ 特性
+
+- 🎤 **本地 ASR**：FunASR SenseVoice-Small，ONNX INT8 推理 ~500ms/句
+- 🔐 **声纹门禁**：ERes2NetV2 验证只识别你自己（避免周围人说话被打字）
+- 🧠 **LLM 后处理润色**：OpenAI 兼容 API，自动修错别字补标点（DeepSeek-V3.2 / GLM-5.1 / 任何兼容服务）
+- ⚡ **熔断 + 缓存 + 公网 fallback**：内网 LLM 故障时自动切到公网 API，重复句命中缓存
+- ⌨️ **IBus 直接注入**：不污染剪贴板，不模拟键盘（`commit_text` 协议）
+- 🔥 **F8 一键热键**：常驻进程模式，模型只加载一次
+- 📚 **项目术语表**：自动扫描你的代码目录提取标识符当热词（"FlashAttention"、"output_gen_pf" 不会被识别成 "闪光注意力"、"输出根据 PF"）
+- 🔄 **配置漂移自动重启**：改 `llm.env` 后按 F8，脚本自动检测并重启
+- 📊 **完整可观测性**：所有阶段（VAD / 声纹 / ASR / LLM / 注入）都有结构化日志
+
+---
+
+## 🏗 架构
+
+```
+┌──────────┐     ┌──────────┐     ┌──────────┐     ┌──────────┐
+│ 麦克风    │────►│ WebRTC   │────►│ 声纹验证  │────►│ SenseVoice│
+│ PulseAudio│     │ VAD      │     │ ERes2NetV2│     │ ASR INT8 │
+└──────────┘     └──────────┘     └──────────┘     └────┬─────┘
+                                       │                 │
+                                       │ ✗ 不是你→丢弃    ▼
+                                       │            ┌──────────┐
+                                       │            │置信度路由 │
+                                       │            └────┬─────┘
+                                       │                 │
+                                       │            ┌────▼─────┐  熔断+缓存
+                                       │            │ LLM 润色  │◄──── DeepSeek/GLM
+                                       │            └────┬─────┘
+                                       │                 │
+                                       │            ┌────▼─────┐
+                                       │            │ 项目术语表│
+                                       │            │ 标准化   │
+                                       │            └────┬─────┘
+                                       │                 │
+                                       └────────────────►│
+                                                         ▼
+                                                   ┌──────────┐
+                                                   │ IBus 注入 │
+                                                   │commit_text│
+                                                   └────┬─────┘
+                                                        ▼
+                                                  💻 当前光标处
+```
+
+---
+
+## ⚡ 60 秒上手
 
 ```bash
+git clone https://github.com/Henderson11/sensevoice-vibe.git
+cd sensevoice-vibe
+./setup.sh                  # 建 venv + pip install
+./download_models.sh        # 拉 1.2GB 模型（ModelScope，国内快）
+./install_ibus_engine.sh    # 装 IBus 引擎
+
+# 配置 LLM API key（必填一项即可，没有也能跑只是没润色）
 mkdir -p ~/.config/sensevoice-vibe
+cp config/llm.env.example ~/.config/sensevoice-vibe/llm.env
+$EDITOR ~/.config/sensevoice-vibe/llm.env  # 填 BASE_URL 和 API_KEY
+
+./enroll_speaker_f8.sh      # 录 10 秒注册你的声纹
+./configure_f8.sh           # 注册 GNOME F8 热键
+./toggle_resident_f8.sh on  # 启动常驻服务
+# 现在按 F8，对麦克风说话，文字直接出现在你光标处
+```
+
+**首次启动**模型加载约 15 秒。之后按 F8 是即时的。
+
+---
+
+## 📋 完整安装 (Runbook)
+
+> 以下步骤是**确定性可执行**的——AI Agent 或新用户按顺序执行，每一步都有**验证命令**和**期望输出**。任何一步验证失败立即停止，不要继续。
+
+### 前置依赖（操作系统层）
+
+Ubuntu / Debian：
+```bash
+sudo apt-get update && sudo apt-get install -y \
+    python3-venv python3-pip git git-lfs \
+    ibus ibus-gtk3 ibus-gtk4 portaudio19-dev libsndfile1 \
+    pulseaudio-utils
 ```
 
 **验证**：
 ```bash
-test -d ~/.config/sensevoice-vibe && echo OK
-# 期望输出：OK
+python3 -c "import sys; assert sys.version_info >= (3,10), '需要 Python 3.10+'; print('python OK')"
+ibus --version | head -1
+git --version
+# 期望：三行输出，无错误
 ```
 
----
-
-### Step 2：写入 `llm.env` 配置文件
-
-把下面整段命令直接复制到终端执行。**先把 `<INTERNAL_KEY>` 和 `<DEEPSEEK_KEY>` 替换为真实 key**，然后执行：
+### Step 1：克隆仓库
 
 ```bash
-INTERNAL_KEY='<INTERNAL_KEY>'         # SpiritX 代理 key，向管理员申请
-DEEPSEEK_KEY='<DEEPSEEK_KEY>'         # 公网 DeepSeek 官方 key，作为 fallback
+git clone https://github.com/Henderson11/sensevoice-vibe.git
+cd sensevoice-vibe
+```
 
-cat > ~/.config/sensevoice-vibe/llm.env <<EOF
-# === LLM 后处理：主链路（内网 SpiritX 代理）===
-SENSEVOICE_POST_LLM_ENABLE=1
-SENSEVOICE_POST_LLM_BASE_URL=http://<INTERNAL_LLM_HOST>:31091/<YOUR_LLM_PROXY_PATH>/v1
-SENSEVOICE_POST_LLM_API_KEY=$INTERNAL_KEY
-SENSEVOICE_POST_LLM_MODEL=DeepSeek-V3.2
-# 当前内网仅这两个模型可选: DeepSeek-V3.2 | GLM-5.1-FP8
+**验证**：
+```bash
+test -f download_models.sh && test -f setup.sh && test -d sensevoice/ && echo "OK"
+# 期望：OK
+```
 
-# === LLM 后处理：fallback 链路（公网 DeepSeek 官方 API）===
-SENSEVOICE_POST_LLM_FALLBACK_BASE_URL=https://api.deepseek.com/v1
-SENSEVOICE_POST_LLM_FALLBACK_API_KEY=$DEEPSEEK_KEY
-SENSEVOICE_POST_LLM_FALLBACK_MODEL=deepseek-chat
+### Step 2：建 venv + 装 Python 依赖
 
-# === 润色行为（短语境编程模式）===
-SENSEVOICE_POST_LLM_MODE=polish_coding_aggressive
-SENSEVOICE_POST_LLM_TIMEOUT_MS=1800
-SENSEVOICE_POST_LLM_MAX_TOKENS=72
-SENSEVOICE_POST_LLM_TEMPERATURE=0
-SENSEVOICE_POST_LLM_MIN_CHARS=5
-SENSEVOICE_POST_LLM_DYNAMIC_MAX_TOKENS=1
-SENSEVOICE_POST_LLM_OUTPUT_TOKEN_FACTOR=0.7
+```bash
+./setup.sh
+# 或手动：
+# python3 -m venv .venv && .venv/bin/pip install -U pip && .venv/bin/pip install -r requirements.txt
+```
 
-# === 熔断与缓存 ===
-SENSEVOICE_POST_LLM_CIRCUIT_MAX_FAILS=4
-SENSEVOICE_POST_LLM_CIRCUIT_COOLDOWN_SEC=25
-SENSEVOICE_POST_LLM_HARD_COOLDOWN_SEC=300
-SENSEVOICE_POST_LLM_RETRY_ON_TIMEOUT=1
-SENSEVOICE_POST_LLM_RETRY_BACKOFF_MS=80
-SENSEVOICE_POST_LLM_CACHE_TTL_SEC=300
-SENSEVOICE_POST_LLM_CACHE_MAX_ENTRIES=120
+**验证**：
+```bash
+.venv/bin/python -c "
+import funasr, modelscope, openai, webrtcvad, soundfile
+print('funasr', funasr.__version__)
+print('modelscope', modelscope.__version__)
+print('openai', openai.__version__)
+print('OK')
+"
+# 期望：四行版本号 + OK
+```
 
-# === 置信度路由（高置信度仍走 LLM，因为是 aggressive 模式）===
-SENSEVOICE_CONF_ROUTE_ENABLE=1
-SENSEVOICE_CONF_ROUTE_HIGH=0.42
-SENSEVOICE_CONF_ROUTE_LOW=0.30
+### Step 3：下载模型
 
-# === 安全权限 ===
-EOF
+```bash
+./download_models.sh
+```
+
+约 1.2GB，下载时间取决于带宽（国内 ModelScope 通常 30 秒~2 分钟）。
+
+**验证**：
+```bash
+ls -lh models/sensevoice-small/model.pt models/eres2netv2/model.pt
+# 期望：两个文件都存在，分别约 936M 和 70M
+```
+
+如果 ModelScope 拉失败，脚本会自动回退到 HuggingFace（需要科学上网）。
+
+### Step 4：装 IBus 引擎
+
+```bash
+./install_ibus_engine.sh
+```
+
+**验证**：
+```bash
+ibus list-engine 2>/dev/null | grep -i sensevoice
+# 期望：sensevoice-voice - SenseVoice Voice Input
+```
+
+如果 ibus 没列出来，重启 IBus：
+```bash
+ibus restart
+```
+
+### Step 5：配置 LLM API key
+
+```bash
+mkdir -p ~/.config/sensevoice-vibe
+cp config/llm.env.example ~/.config/sensevoice-vibe/llm.env
 chmod 600 ~/.config/sensevoice-vibe/llm.env
 ```
 
-**验证**（确认两个 key 都已写入且非空）：
+编辑 `~/.config/sensevoice-vibe/llm.env`，把这两行填实际值：
+
 ```bash
-grep -E "^SENSEVOICE_POST_LLM_(API_KEY|FALLBACK_API_KEY)=" ~/.config/sensevoice-vibe/llm.env \
-  | awk -F= '{ if (length($2) < 20) print "FAIL: "$1" 长度异常 ("length($2)")"; else print "OK: "$1" 长度="length($2) }'
-# 期望输出（两行 OK）：
-#   OK: SENSEVOICE_POST_LLM_API_KEY 长度=51
-#   OK: SENSEVOICE_POST_LLM_FALLBACK_API_KEY 长度=35
+SENSEVOICE_POST_LLM_BASE_URL=<YOUR_LLM_BASE_URL>      # 例如 https://api.deepseek.com/v1
+SENSEVOICE_POST_LLM_API_KEY=<YOUR_LLM_API_KEY>        # 例如 sk-xxxxxxxx
+SENSEVOICE_POST_LLM_MODEL=DeepSeek-V3.2               # 你的服务支持的 model id
 ```
 
----
-
-### Step 3：验证内网代理 API 可达
-
+**验证**（确认 API 可达）：
 ```bash
 set -a; source ~/.config/sensevoice-vibe/llm.env; set +a
 curl -sS -m 5 -H "Authorization: Bearer $SENSEVOICE_POST_LLM_API_KEY" \
-  "$SENSEVOICE_POST_LLM_BASE_URL/models" | python3 -c "
-import sys, json
-d = json.load(sys.stdin)
-ids = [m['id'] for m in d.get('data', [])]
-print('available_models:', sorted(ids))
-assert 'DeepSeek-V3.2' in ids, 'DeepSeek-V3.2 不在可用列表里'
-print('OK: DeepSeek-V3.2 可用')
-"
+  "$SENSEVOICE_POST_LLM_BASE_URL/models" \
+  | python3 -c "import sys,json; d=json.load(sys.stdin); print('models:', [m['id'] for m in d['data']][:5])"
+# 期望：models: ['DeepSeek-V3.2', ...] 类似列表
 ```
 
-**期望输出**（包含且仅以 `OK:` 结尾即通过）：
-```
-available_models: ['DeepSeek-V3.2', 'GLM-5.1-FP8']
-OK: DeepSeek-V3.2 可用
-```
+> **不想用 LLM 润色？** 把 `SENSEVOICE_POST_LLM_ENABLE=0` 即可，仍能正常 ASR。
 
-**失败处理**：
-- `Could not resolve host` / `Connection refused` → 检查内网/VPN 连通性，`ping <INTERNAL_LLM_HOST>`
-- `401 Unauthorized` → API key 错误，回到 Step 2 重写
-- `available_models` 不含 `DeepSeek-V3.2` → 内网模型变更，把 Step 2 的 `SENSEVOICE_POST_LLM_MODEL` 改成实际可用的（如 `GLM-5.1-FP8`）
-
----
-
-### Step 4：发一次 chat completion 实际测试
+### Step 6：注册你的声纹（声纹门禁需要）
 
 ```bash
-set -a; source ~/.config/sensevoice-vibe/llm.env; set +a
-curl -sS -m 8 "$SENSEVOICE_POST_LLM_BASE_URL/chat/completions" \
-  -H "Authorization: Bearer $SENSEVOICE_POST_LLM_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d "{\"model\":\"$SENSEVOICE_POST_LLM_MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"把下面这句话修一下错别字，只回结果不解释：缓存甚至算缓村\"}],\"max_tokens\":40,\"temperature\":0}" \
-  | python3 -c "
-import sys, json
-d = json.load(sys.stdin)
-out = d['choices'][0]['message']['content'].strip()
-print('LLM 返回:', repr(out))
-assert '缓存' in out, '返回内容不含\"缓存\"，LLM 行为异常'
-print('OK: 链路通且模型行为正常')
-"
+./enroll_speaker_f8.sh
 ```
 
-**期望输出**：
-```
-LLM 返回: '缓存甚至算缓存'
-OK: 链路通且模型行为正常
+按提示对麦克风说话 10 秒（**说什么内容都行**，重要的是声音特征）。
+
+**验证**：
+```bash
+ls -lh ~/.local/state/sensevoice-vibe/speaker_enroll.d/
+# 期望：至少一个 *.wav 文件，约 320KB ~ 1MB
 ```
 
----
+> **不想用声纹门禁？**（单人独占的电脑可以关）：编辑 `llm.env` 把 `SENSEVOICE_SPK_ENABLE=0`。
 
-### Step 5：重启常驻服务以应用新配置
+### Step 7：注册 F8 热键 + 启动常驻服务
 
 ```bash
-./toggle_resident_f8.sh restart
+./configure_f8.sh                # 注册 GNOME 全局快捷键 F8
+./toggle_resident_f8.sh on       # 冷启动常驻服务
 ```
 
-**验证**（等模型加载约 5~15 秒后）：
+**验证**：
 ```bash
 sleep 10 && ./toggle_resident_f8.sh status
-# 期望输出：running=1 ready=1 active=1 pid=<新PID>
+# 期望：running=1 ready=1 active=1 pid=<某个数字>
+
+grep -E "MODEL_READY|POST_LLM enabled" ~/.local/state/sensevoice-vibe/stream_vad.log | tail -3
+# 期望（关键字）：
+#   MODEL_READY
+#   POST_LLM enabled=1 model=DeepSeek-V3.2 reason=ready
 ```
 
-**进一步验证**（确认 LLM 模块已就绪、模型名正确）：
+### Step 8：端到端验证
+
+打开任意输入框（浏览器地址栏 / 终端 / 编辑器），按 **F8**，对麦克风说一句话，比如：
+> "现在是测试语音输入的功能"
+
+应该看到文字直接出现在光标处。
+
+查看日志确认：
 ```bash
-grep -E "POST_LLM enabled" ~/.local/state/sensevoice-vibe/stream_vad.log | tail -1
-# 期望输出（关键字段：enabled=1, model=DeepSeek-V3.2, reason=ready）：
-# 2026-XX-XX HH:MM:SS [INFO] POST_LLM enabled=1 model=DeepSeek-V3.2 fallback=deepseek-chat reason=ready:model=DeepSeek-V3.2,fallback=deepseek-chat
+tail -3 ~/.local/state/sensevoice-vibe/stream_vad.log | grep "FINAL mode"
+# 期望：FINAL mode=PARTIAL text=现在是测试语音输入的功能
 ```
+
+🎉 **如果看到 `FINAL mode=...` 行 = 部署成功**。
 
 ---
 
-### Step 6：端到端验证（说一句话，看 LLM 是否润色）
+## 🎛 配置
 
-按 F8 开始录音，对着麦克风说一句**故意带错的话**，比如：
-> "这个缓村的设计需要再优化"
+所有配置集中在 `~/.config/sensevoice-vibe/llm.env`。修改后必须重启服务：
 
-然后看日志：
 ```bash
-tail -5 ~/.local/state/sensevoice-vibe/stream_vad.log | grep POST_LLM_APPLY
-# 期望看到一行：
-# POST_LLM_APPLY src=这个缓村的设计需要再优化。 dst=这个缓存的设计需要再优化。 route=high
-```
-
-如果看到 `POST_LLM_APPLY` 且 `src` 和 `dst` 不同 → **部署成功**。
-
----
-
-### 失败诊断速查表
-
-| 日志关键字 | 含义 | 处理 |
-|-----------|------|------|
-| `POST_LLM enabled=0 reason=disabled` | 配置里 `ENABLE` 为 0 | 检查 `llm.env` 的 `SENSEVOICE_POST_LLM_ENABLE=1` |
-| `POST_LLM enabled=0 reason=missing_*` | API key 或 base_url 缺失 | 回到 Step 2 重写 |
-| `POST_LLM_SKIP reason=circuit_open` | 熔断中 | 等待 25 秒后自动恢复，或检查内网连通 |
-| `POST_LLM_SKIP reason=text_too_short` | 文本短于 5 字 | 正常行为，无需处理 |
-| 完全没有 `POST_LLM*` 行 | 服务没起来或没说话 | `./toggle_resident_f8.sh status` 看 ready/active |
-
----
-
-### 切换模型（不需要重新部署）
-
-要把润色模型从 DeepSeek 换成 GLM-5.1：
-```bash
-sed -i 's/^SENSEVOICE_POST_LLM_MODEL=.*/SENSEVOICE_POST_LLM_MODEL=GLM-5.1-FP8/' \
-  ~/.config/sensevoice-vibe/llm.env
 ./toggle_resident_f8.sh restart
 ```
 
-按 F8 时脚本也会**自动检测 `llm.env` 改动**并重启进程，无需手动 `restart`。
+> 💡 也可以按 F8——脚本会自动检测 `llm.env` 比进程新，自动重启。
 
-> ⚠️ **关键**：F8 的 `on/off/toggle` 默认只切换录音 active 位，**不重启进程**。修改 `llm.env` 后必须显式 `restart` 或让脚本自动检测漂移触发重启，否则改动不会生效（环境变量在进程启动时就固化在内存里了）。
+### 关键配置项
 
-## 使用
+| 配置 | 说明 | 默认值 |
+|------|------|--------|
+| `SENSEVOICE_POST_LLM_ENABLE` | LLM 润色总开关 | 1 |
+| `SENSEVOICE_POST_LLM_BASE_URL` | LLM API URL（OpenAI 兼容） | 必填 |
+| `SENSEVOICE_POST_LLM_API_KEY` | API key | 必填 |
+| `SENSEVOICE_POST_LLM_MODEL` | 主模型 id | DeepSeek-V3.2 |
+| `SENSEVOICE_POST_LLM_MODE` | 润色策略：`polish_coding_aggressive`/`polish_coding`/`polish` | aggressive |
+| `SENSEVOICE_SPK_ENABLE` | 声纹门禁开关 | 1 |
+| `SENSEVOICE_SPK_THRESHOLD` | 相似度阈值，高=严 | 0.60 |
+| `SENSEVOICE_STREAM_ENDPOINT_MS` | 静音判句尾阈值 (ms) | 1500 |
+| `SENSEVOICE_STREAM_MAX_SEGMENT_MS` | 单段最大时长 (ms) | 30000 |
+| `SENSEVOICE_PROJECT_ROOT` | 项目术语表扫描目录 | $HOME |
+| `SENSEVOICE_INJECT_MODE` | `ibus`（推荐）/ `clipboard`（兼容） | ibus |
+| `SENSEVOICE_LANGUAGE` | `auto`/`zh`/`en`/`yue`/`ja`/`ko` | auto |
+
+完整列表见 [`config/llm.env.example`](config/llm.env.example)。
+
+### 切换模型
 
 ```bash
-# F8 开启/关闭语音输入（GNOME 全局快捷键）
-# 第一次 F8：开始监听
-# 说话 → 自动断句 → 润色 → 注入到当前输入框
-# 第二次 F8：停止监听
+sed -i 's/^SENSEVOICE_POST_LLM_MODEL=.*/SENSEVOICE_POST_LLM_MODEL=GLM-5.1-FP8/' \
+    ~/.config/sensevoice-vibe/llm.env
+./toggle_resident_f8.sh restart
+```
 
-# 手动启动（调试用）
-./toggle_resident_f8.sh on
+### 不要 LLM 润色（纯本地）
 
-# 查看状态
-./toggle_resident_f8.sh status
+```bash
+sed -i 's/^SENSEVOICE_POST_LLM_ENABLE=.*/SENSEVOICE_POST_LLM_ENABLE=0/' \
+    ~/.config/sensevoice-vibe/llm.env
+./toggle_resident_f8.sh restart
+```
 
-# 查看实时日志
+---
+
+## 📊 性能与延迟
+
+实测（i7-13700H CPU 单核 ONNX INT8，无 GPU）：
+
+| 阶段 | 时间 |
+|------|------|
+| ASR 推理（一句 5 秒音频） | ~500 ms |
+| 声纹验证 | ~200 ms |
+| LLM 润色（DeepSeek 内网） | 1000~2000 ms |
+| IBus 注入 | ~50 ms |
+| **尾延迟**（说完最后一个字 → 出字） | **~3.5 秒**（含 1.5s VAD endpoint 等待） |
+
+**模型大小**：
+
+| 模型 | 大小 | 参数量 |
+|------|------|--------|
+| SenseVoice-Small (PT) | 936 MB | 234M |
+| SenseVoice-Small (ONNX INT8) | 232 MB | 234M (量化) |
+| ERes2NetV2 (声纹) | 70 MB | - |
+| CAM++ (声纹备用) | 28 MB | - |
+
+---
+
+## 🩺 故障排查
+
+| 症状 | 原因 | 修复 |
+|------|------|------|
+| F8 没反应 | 热键被其他程序占用 / GNOME 快捷键未注册 | `./configure_f8.sh` 重注册；或 GNOME Settings > Keyboard 检查 |
+| `running=0` | 常驻进程没起来 | `cat ~/.local/state/sensevoice-vibe/resident.stdout.log` 看错误 |
+| `ready=0` 卡住 | 模型加载失败 | 检查 `models/sensevoice-small/model.pt` 是否完整 |
+| 说话没字出来 | 声纹被门禁挡了 | 看日志 `DROP_FINAL_SPK score=...`；如果 score 低→重新 enroll，如果 score ≥ 0.5→把阈值调低 |
+| 字出来了但全是错别字 | LLM 润色没生效 | `grep "POST_LLM enabled" ~/.local/state/sensevoice-vibe/stream_vad.log`，看 reason= |
+| LLM 调用超时 | 网络慢 / 服务过载 | `POST_LLM_TIMEOUT_MS` 加大；或换 fallback URL |
+| 改了 `llm.env` 不生效 | 进程没重启 | `./toggle_resident_f8.sh restart`（**F8 默认只切换录音状态，不重启进程**——但脚本会自动检测 mtime 漂移触发 restart） |
+| 说话半截就出字 | VAD endpoint 太短 | `SENSEVOICE_STREAM_ENDPOINT_MS` 加大（默认 1500） |
+| 长句被切两段 | 段长超过 MAX_SEGMENT | `SENSEVOICE_STREAM_MAX_SEGMENT_MS` 加大（默认 30000） |
+| 旁人说话也被识别 | 声纹门禁阈值太低 | `SENSEVOICE_SPK_THRESHOLD` 提高（如 0.6 → 0.7） |
+
+### 实时观测日志
+
+```bash
 tail -f ~/.local/state/sensevoice-vibe/stream_vad.log
 ```
 
-## 依赖
+关键日志关键字：
 
-- Python 3.10+
-- FunASR 1.3.1 (SenseVoice ASR)
-- SpeechBrain 1.0.3 (ECAPA-TDNN 声纹验证)
-- PyTorch 2.10+ (CPU 或 GPU)
-- webrtcvad (VAD)
-- IBus (GNOME 输入法框架)
-- OpenAI 兼容 API (LLM 后处理)
+```
+SEG id=N            ← 新段开始
+SPEECH_START        ← 检测到说话
+SPK_PASS  score=X   ← 声纹通过
+DROP_FINAL_SPK      ← 声纹拒绝（不是你）
+CONF_SCORE score=X  ← ASR 置信度
+POST_LLM_APPLY      ← LLM 改了文本
+POST_LLM_PASS       ← LLM 觉得不用改
+FINAL mode=...      ← 最终注入
+```
+
+---
+
+## 🛣 路线图
+
+- [ ] 流式 ASR 输出（VAD 切完前就开始 partial 注入，缩短尾延迟）
+- [ ] Wayland 原生支持（当前依赖 IBus + X11/XWayland）
+- [ ] Web UI 实时监控（VAD 波形 / 置信度 / 模型状态）
+- [ ] 多人多声纹（家庭/团队场景，按声纹分用户）
+- [ ] 命令模式（识别"打开浏览器"等指令而非转文字）
+- [ ] macOS / Windows 移植
+
+---
+
+## 🤝 贡献
+
+欢迎 PR！流程：
+
+1. Fork → 建个特性分支 `feat/xxx`
+2. 改代码，跑一下 `./toggle_resident_f8.sh restart` 自测
+3. 提交 PR，描述里写"为什么"+"怎么验证"
+
+调试时建议把 `SENSEVOICE_DEBUG_INJECT=1` 打开（默认开），日志最详细。
+
+---
+
+## 📜 许可证 & 鸣谢
+
+本项目代码：**MIT License**
+
+依赖的开源项目（许可证遵循各自原协议）：
+
+- [FunASR](https://github.com/modelscope/FunASR) — 阿里达摩院 / 通义实验室，SenseVoice ASR 模型
+- [3D-Speaker](https://github.com/modelscope/3D-Speaker) — 阿里通义实验室，ERes2NetV2 / CAM++ 声纹模型
+- [IBus](https://github.com/ibus/ibus) — Linux 输入法框架
+- [WebRTC VAD](https://github.com/wiseman/py-webrtcvad) — Google WebRTC 项目的 VAD
+- [DeepSeek API](https://platform.deepseek.com/) — LLM 后处理（其他 OpenAI 兼容 API 也可）
+
+特别感谢 [SenseVoice 论文](https://arxiv.org/abs/2407.04051) 给了一个值得本地部署的高质量多语 ASR 模型。
+
+---
+
+<div align="center">
+
+**如果这个项目帮到你，给个 ⭐ Star 让更多人发现它**
+
+[Issues](https://github.com/Henderson11/sensevoice-vibe/issues) · [Discussions](https://github.com/Henderson11/sensevoice-vibe/discussions) · [PRs](https://github.com/Henderson11/sensevoice-vibe/pulls)
+
+</div>
