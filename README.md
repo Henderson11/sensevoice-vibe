@@ -120,18 +120,25 @@ $EDITOR ~/.config/sensevoice-vibe/llm.env  # 填 BASE_URL 和 API_KEY
 Ubuntu / Debian：
 ```bash
 sudo apt-get update && sudo apt-get install -y \
-    python3-venv python3-pip git git-lfs \
-    ibus ibus-gtk3 ibus-gtk4 portaudio19-dev libsndfile1 \
-    pulseaudio-utils
+    python3-venv python3-pip git \
+    ibus ibus-gtk3 ibus-gtk4 \
+    python3-gi gir1.2-ibus-1.0 \
+    portaudio19-dev libsndfile1 \
+    alsa-utils pulseaudio-utils
 ```
+
+> ⚠️ `python3-gi` + `gir1.2-ibus-1.0` 是必需的——IBus engine 用 `/usr/bin/python3`（不是 venv）调 GObject Introspection。
 
 **验证**：
 ```bash
 python3 -c "import sys; assert sys.version_info >= (3,10), '需要 Python 3.10+'; print('python OK')"
+/usr/bin/python3 -c "from gi.repository import IBus; print('gi+IBus OK')"
 ibus --version | head -1
-git --version
-# 期望：三行输出，无错误
+arecord --version | head -1
+# 期望：四行 OK / 版本号，无错误
 ```
+
+> 💡 **不想分步装？** 直接跑 `./install.sh` 一键完成 Step 1~7，自动检查系统依赖、装 venv、拉模型、注册 IBus、绑定 F8。
 
 ### Step 1：克隆仓库
 
@@ -146,24 +153,22 @@ test -f download_models.sh && test -f setup.sh && test -d sensevoice/ && echo "O
 # 期望：OK
 ```
 
-### Step 2：建 venv + 装 Python 依赖
+### Step 2：建 venv + 装 Python 依赖 + 注册 funasr patch
 
 ```bash
 ./setup.sh
-# 或手动：
-# python3 -m venv .venv && .venv/bin/pip install -U pip && .venv/bin/pip install -r requirements.txt
 ```
 
-**验证**：
+`setup.sh` 内部做了：建 venv → 装 PyTorch（自动检测 GPU）→ 装 requirements.txt 全部依赖 → 把 ERes2NetV2 patch 到 FunASR → 验证关键 import → 检查 `/usr/bin/python3 + gi`。
+
+**验证**（setup.sh 末尾会自动跑这个，应全部 `ok`）：
 ```bash
 .venv/bin/python -c "
-import funasr, modelscope, openai, webrtcvad, soundfile
-print('funasr', funasr.__version__)
-print('modelscope', modelscope.__version__)
-print('openai', openai.__version__)
-print('OK')
+import funasr, funasr_onnx, modelscope, huggingface_hub, webrtcvad, soundfile, torch
+print('all imports OK')
+print('funasr', funasr.__version__, '/ torch', torch.__version__)
 "
-# 期望：四行版本号 + OK
+# 期望：all imports OK + 版本号
 ```
 
 ### Step 3：下载模型
