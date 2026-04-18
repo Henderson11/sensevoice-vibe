@@ -48,11 +48,7 @@ download_asr() {
     return 0
   fi
   echo "==> 下载 ASR (SenseVoice-Small, ~1.1GB)"
-  if ms_download "iic/SenseVoiceSmall" "$target"; then
-    : # ModelScope 文件名已经是 model.pt + configuration.json，无需后处理
-  else
-    hf_download "FunAudioLLM/SenseVoiceSmall" "$target"
-  fi
+  ms_download "iic/SenseVoiceSmall" "$target" || hf_download "FunAudioLLM/SenseVoiceSmall" "$target"
 }
 
 # ============ 声纹 ERes2NetV2 ============

@@ -49,7 +49,7 @@ if [[ ! -f "$CONFIG_DIR/llm.env" ]]; then
   sed -i "s|^SENSEVOICE_SPK_CACHE_DIR=.*|SENSEVOICE_SPK_CACHE_DIR=$ROOT_DIR/models/eres2netv2|" "$CONFIG_DIR/llm.env"
   sed -i "s|^SENSEVOICE_PROJECT_ROOT=.*|SENSEVOICE_PROJECT_ROOT=$HOME|" "$CONFIG_DIR/llm.env"
   echo "  配置文件已创建: $CONFIG_DIR/llm.env"
-  echo "  ⚠ 请编辑填入 LLM API key（不用 LLM 润色可设 SENSEVOICE_POST_LLM_ENABLE=0）"
+  echo "  ⚠ 请编辑填入 LLM API key；如要纯本地模式可设 SENSEVOICE_POST_LLM_ENABLE=0"
 else
   echo "  配置文件已存在，跳过: $CONFIG_DIR/llm.env"
 fi

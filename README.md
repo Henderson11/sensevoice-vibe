@@ -17,39 +17,31 @@
 
 ---
 
-## 💡 这是什么
+## 💡 是什么
 
-写代码 / 写文档 / 写消息时，敲键盘累。这个项目让你：
+> **按一下 F8 → 对着麦克风说话 → 文字直接出现在当前光标处**
 
-> **按一下 F8 → 对着麦克风说话 → 屏幕里的光标处直接出现文字**
+完全本地的 Linux 桌面语音输入：音频在本机完成识别，结果通过 IBus 协议发送到当前焦点应用。面向需要长时间口述代码、文档或聊天内容的人。
 
-跟一般"语音转文字"工具的差别：
-
-| | 一般方案 | **SenseVoice Vibe** |
-|---|---|---|
-| **识别引擎** | 走云 API（百度/讯飞/Azure） | **本地 ASR**（SenseVoice INT8，~500ms/句） |
-| **隐私** | 音频上传服务器 | **音频不出本机** |
-| **旁人说话** | 全部识别注入 | **声纹门禁** — 只识别你自己 |
-| **错别字** | 写错就错 | **LLM 润色**（DeepSeek/GLM/Qwen，可换） |
-| **注入方式** | 复制粘贴（污染剪贴板） | **IBus commit_text** — 直接发到光标 |
-| **热词** | 手工维护 | **自动从你代码目录提取**编程术语 |
-| **专业术语** | "组网" | **"整网"**（你项目的固有词被保留） |
-
-适合：在 Linux 写代码的人、信息安全要求高的场景、不愿意每月花钱订阅云 ASR 的人。
+适合的使用场景：
+- Linux 桌面（GNOME / KDE / X11 / Wayland，需 IBus）
+- 需要把音频和识别留在本机的场合
+- 多人办公环境——只有注册过声纹的本人会被识别
+- 涉及大量项目内私有术语、变量名、函数名的口述
 
 ---
 
 ## ✨ 特性
 
-- 🎤 **本地 ASR**：FunASR SenseVoice-Small，ONNX INT8 推理 ~500ms/句
-- 🔐 **声纹门禁**：ERes2NetV2 验证只识别你自己（避免周围人说话被打字）
-- 🧠 **LLM 后处理润色**：OpenAI 兼容 API，自动修错别字补标点（DeepSeek-V3.2 / GLM-5.1 / 任何兼容服务）
-- ⚡ **熔断 + 缓存 + 公网 fallback**：内网 LLM 故障时自动切到公网 API，重复句命中缓存
-- ⌨️ **IBus 直接注入**：不污染剪贴板，不模拟键盘（`commit_text` 协议）
-- 🔥 **F8 一键热键**：常驻进程模式，模型只加载一次
-- 📚 **项目术语表**：自动扫描你的代码目录提取标识符当热词（"FlashAttention"、"output_gen_pf" 不会被识别成 "闪光注意力"、"输出根据 PF"）
-- 🔄 **配置漂移自动重启**：改 `llm.env` 后按 F8，脚本自动检测并重启
-- 📊 **完整可观测性**：所有阶段（VAD / 声纹 / ASR / LLM / 注入）都有结构化日志
+- 🎤 **本地 ASR**：FunASR SenseVoice-Small（ONNX INT8 量化），单句推理 ~500ms
+- 🔐 **声纹门禁**：ERes2NetV2 验证发声者身份，仅注册声纹通过
+- 🧠 **LLM 后处理润色**：OpenAI 兼容 API（DeepSeek-V3.2 / GLM-5.1 / Qwen 等）修正错别字与标点，并保留项目专业术语
+- 🛡 **熔断 + 缓存 + 双链路**：主 LLM 异常自动降级到 fallback，重复短语命中本地缓存
+- ⌨️ **IBus 原生注入**：通过 `commit_text` 协议直接写入焦点应用，剪贴板与键盘事件保持原样
+- 🔥 **F8 一键控制**：常驻进程持有模型，热键只切换录音状态
+- 📚 **项目术语表**：扫描代码目录提取标识符作为 ASR 热词（如 `FlashAttention`、`output_gen_pf` 保持原样输出）
+- 🔄 **配置漂移检测**：`llm.env` 修改后 F8 自动触发服务重启
+- 📊 **结构化日志**：VAD / 声纹 / ASR / LLM / 注入每阶段独立日志行，便于诊断
 
 ---
 
@@ -126,9 +118,7 @@ sudo apt-get update && sudo apt-get install -y \
     libsndfile1 alsa-utils pulseaudio-utils
 ```
 
-> ⚠️ `python3-gi` + `gir1.2-ibus-1.0` 是必需的——IBus engine 用 `/usr/bin/python3`（不是 venv）调 GObject Introspection。
->
-> 不需要 `portaudio19-dev` / `pyaudio`——本项目用 `arecord` 直读 ALSA raw PCM。
+> IBus engine 通过 `/usr/bin/python3` 调用 GObject Introspection，因此 `python3-gi` 与 `gir1.2-ibus-1.0` 必须装在系统层（不在 venv 内）。
 
 **验证**：
 ```bash
@@ -139,7 +129,7 @@ arecord --version | head -1
 # 期望：四行 OK / 版本号，无错误
 ```
 
-> 💡 **不想分步装？** 直接跑 `./install.sh` 一键完成 Step 1~7，自动检查系统依赖、装 venv、拉模型、注册 IBus、绑定 F8。
+> 💡 **一键模式**：跑 `./install.sh` 自动完成 Step 1~7（系统依赖检查 / venv / 模型 / IBus / 热键）。本节是手动分步的对照说明。
 
 ### Step 1：克隆仓库
 
@@ -230,7 +220,7 @@ curl -sS -m 5 -H "Authorization: Bearer $SENSEVOICE_POST_LLM_API_KEY" \
 # 期望：models: ['DeepSeek-V3.2', ...] 类似列表
 ```
 
-> **不想用 LLM 润色？** 把 `SENSEVOICE_POST_LLM_ENABLE=0` 即可，仍能正常 ASR。
+> 关闭 LLM 润色：`SENSEVOICE_POST_LLM_ENABLE=0`。ASR 与声纹仍正常工作，识别结果直接注入。
 
 ### Step 6：注册你的声纹（声纹门禁需要）
 
@@ -246,7 +236,7 @@ ls -lh ~/.local/state/sensevoice-vibe/speaker_enroll.d/
 # 期望：至少一个 *.wav 文件，约 320KB ~ 1MB
 ```
 
-> **不想用声纹门禁？**（单人独占的电脑可以关）：编辑 `llm.env` 把 `SENSEVOICE_SPK_ENABLE=0`。
+> 关闭声纹门禁（单人独占电脑场景）：`SENSEVOICE_SPK_ENABLE=0`。
 
 ### Step 7：注册 F8 热键 + 启动常驻服务
 
@@ -320,7 +310,7 @@ sed -i 's/^SENSEVOICE_POST_LLM_MODEL=.*/SENSEVOICE_POST_LLM_MODEL=GLM-5.1-FP8/' 
 ./toggle_resident_f8.sh restart
 ```
 
-### 不要 LLM 润色（纯本地）
+### 关闭 LLM 润色（纯本地模式）
 
 ```bash
 sed -i 's/^SENSEVOICE_POST_LLM_ENABLE=.*/SENSEVOICE_POST_LLM_ENABLE=0/' \
@@ -363,7 +353,7 @@ sed -i 's/^SENSEVOICE_POST_LLM_ENABLE=.*/SENSEVOICE_POST_LLM_ENABLE=0/' \
 | 说话没字出来 | 声纹被门禁挡了 | 看日志 `DROP_FINAL_SPK score=...`；如果 score 低→重新 enroll，如果 score ≥ 0.5→把阈值调低 |
 | 字出来了但全是错别字 | LLM 润色没生效 | `grep "POST_LLM enabled" ~/.local/state/sensevoice-vibe/stream_vad.log`，看 reason= |
 | LLM 调用超时 | 网络慢 / 服务过载 | `POST_LLM_TIMEOUT_MS` 加大；或换 fallback URL |
-| 改了 `llm.env` 不生效 | 进程没重启 | `./toggle_resident_f8.sh restart`（**F8 默认只切换录音状态，不重启进程**——但脚本会自动检测 mtime 漂移触发 restart） |
+| 改了 `llm.env` 不生效 | 配置在进程启动时载入内存 | `./toggle_resident_f8.sh restart`（按 F8 也会触发：脚本检测到 `llm.env` mtime 比进程新会自动重启） |
 | 说话半截就出字 | VAD endpoint 太短 | `SENSEVOICE_STREAM_ENDPOINT_MS` 加大（默认 1500） |
 | 长句被切两段 | 段长超过 MAX_SEGMENT | `SENSEVOICE_STREAM_MAX_SEGMENT_MS` 加大（默认 30000） |
 | 旁人说话也被识别 | 声纹门禁阈值太低 | `SENSEVOICE_SPK_THRESHOLD` 提高（如 0.6 → 0.7） |
@@ -380,10 +370,10 @@ tail -f ~/.local/state/sensevoice-vibe/stream_vad.log
 SEG id=N            ← 新段开始
 SPEECH_START        ← 检测到说话
 SPK_PASS  score=X   ← 声纹通过
-DROP_FINAL_SPK      ← 声纹拒绝（不是你）
+DROP_FINAL_SPK      ← 声纹未通过（非注册声纹）
 CONF_SCORE score=X  ← ASR 置信度
-POST_LLM_APPLY      ← LLM 改了文本
-POST_LLM_PASS       ← LLM 觉得不用改
+POST_LLM_APPLY      ← LLM 改写了文本
+POST_LLM_PASS       ← LLM 判定无需改写
 FINAL mode=...      ← 最终注入
 ```
 

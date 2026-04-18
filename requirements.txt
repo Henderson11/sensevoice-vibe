@@ -1,27 +1,20 @@
-# SenseVoice 语音输入系统 - Python 依赖（venv 内）
-# 安装: pip install -r requirements.txt
-#
-# 注意：IBus engine (ibus-sensevoice/sensevoice_engine.py) 用 /usr/bin/python3，
-# 不在 venv 内，需要系统 apt 装 python3-gi + gir1.2-ibus-1.0（不在此处）
+# SenseVoice Vibe — Python 依赖（venv 内）
+# 安装：pip install -r requirements.txt
 
-# === ASR ===
+# ASR 引擎
 funasr==1.3.1
-funasr-onnx==0.4.1            # ASR ONNX INT8 后端（model_quant.onnx 用）
+funasr-onnx==0.4.1
 
-# === 模型下载 ===
-modelscope>=1.34.0            # 主下载（国内快）
-huggingface_hub>=0.20         # fallback 下载
+# 模型下载
+modelscope>=1.34.0
+huggingface_hub>=0.20
 
-# === VAD ===
+# 语音活动检测
 webrtcvad-wheels==2.0.14
 
-# === PyTorch（CPU；GPU 用户自行换 --index-url）===
+# 推理后端（CPU 默认；GPU 自行替换 --index-url 为 cu121）
 torch==2.10.0+cpu
 torchaudio==2.10.0+cpu
 
-# === 音频处理 ===
-# soundfile 由 funasr 自动拉，不需显式列出（代码用 wave 标准库读 PCM）
+# 数值计算
 numpy>=2.0
-
-# === LLM 后处理（OpenAI 兼容协议）===
-# 不需要 openai SDK——sensevoice/llm/postprocessor.py 直接用 urllib.request 调 HTTP API
