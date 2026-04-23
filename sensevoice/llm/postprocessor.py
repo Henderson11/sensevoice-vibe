@@ -377,6 +377,19 @@ class LLMPostProcessor:
             "max_tokens": req_max_tokens,
             "stream": False,
         }
+        # 关闭 reasoning 模型的思考过程（润色任务不需要 CoT，~7x 加速）
+        # 不同模型族用不同参数名，全部带上让代理择其能识别的：
+        # - Kimi-K2.6 用 chat_template_kwargs.thinking
+        # - GLM-5.x  用 chat_template_kwargs.enable_thinking
+        # - Moonshot 官方 API 用顶层 thinking.type
+        ml = (model_name or "").lower()
+        if any(k in ml for k in ("kimi", "glm", "qwen", "thinking", "reasoning", "deepseek-r")):
+            ctk = {}
+            if "kimi" in ml:
+                ctk["thinking"] = False
+            else:
+                ctk["enable_thinking"] = False
+            payload["chat_template_kwargs"] = ctk
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         req = urllib.request.Request(
             url,
