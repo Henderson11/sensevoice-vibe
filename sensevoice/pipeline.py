@@ -245,6 +245,19 @@ class SenseVoicePipeline:
         append_state_log(self.args.state_log, f"STREAM_STOP reason={reason}")
 
     def _setup_signals(self):
+        # faulthandler：捕获 SIGSEGV/SIGABRT/SIGFPE/SIGBUS 等致命错误的 traceback
+        # 写到独立文件，避免与 stdout 抢 buffer
+        import faulthandler
+        fault_log_path = self.args.state_log.replace(".log", ".fault.log")
+        if not fault_log_path.endswith(".fault.log"):
+            fault_log_path = self.args.state_log + ".fault.log"
+        self._fault_fh = open(fault_log_path, "a", buffering=1)
+        faulthandler.enable(file=self._fault_fh, all_threads=True)
+
+        # SIGPIPE 屏蔽：防止 LLM HTTP 连接 reset 时被 SIGPIPE 默认行为杀进程
+        if hasattr(signal, "SIGPIPE"):
+            signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+
         def _stop(_sig, _frame):  # noqa: ARG001
             sig_name = signal.Signals(_sig).name if hasattr(signal, 'Signals') else str(_sig)
             append_state_log(
@@ -270,6 +283,7 @@ class SenseVoicePipeline:
             signal.signal(signal.SIGUSR2, _activate)
         if hasattr(signal, "SIGHUP"):
             signal.signal(signal.SIGHUP, _deactivate)
+        append_state_log(self.args.state_log, f"SIGNAL_TRAPS_INSTALLED faulthandler={fault_log_path}")
 
     def _process_finalized_segment(self, samples: np.ndarray, seg_ms: float):
         """处理已结束的语音段：声纹 → ASR → LLM → 注入"""
@@ -439,6 +453,7 @@ class SenseVoicePipeline:
         append_state_log(args.state_log, f"DAEMON_START resident={int(args.resident)} active={int(self.active)}")
 
         try:
+          try:
             while not self.stop_flag:
                 if self.force_active is not None:
                     if self.active != self.force_active:
@@ -562,6 +577,21 @@ class SenseVoicePipeline:
                 self.trailing_silence = 0
                 self.segment = bytearray()
                 self.pre_roll.clear()
+          except BaseException as _exc:
+            import traceback as _tb
+            tb_text = "".join(_tb.format_exception(type(_exc), _exc, _exc.__traceback__))
+            append_state_log(
+                args.state_log,
+                f"FATAL_EXCEPTION type={type(_exc).__name__} msg={_exc!s}",
+                level="ERROR",
+            )
+            try:
+                with open(args.state_log + ".traceback", "a", buffering=1) as _tf:
+                    _tf.write(f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} pid={os.getpid()} ===\n")
+                    _tf.write(tb_text)
+            except Exception:
+                pass
+            raise
         finally:
             self.stop_capture("shutdown")
             if self.indicator:
