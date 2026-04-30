@@ -227,20 +227,78 @@ class SenseVoicePipeline:
         append_state_log(self.args.state_log, "STREAM_START")
 
     def stop_capture(self, reason: str):
-        if self.proc is None:
-            return
         if self.in_speech and self.indicator:
             self.indicator.on_speech_end()
             append_state_log(self.args.state_log, "SPEECH_END")
+
+        # 已知子进程：SIGTERM → 2s 等待 → SIGKILL → 短等待
+        proc = self.proc
+        if proc is not None:
+            try:
+                proc.terminate()
+            except Exception as e:
+                append_state_log(self.args.state_log, f"STREAM_STOP_TERM_ERR {type(e).__name__}: {e}")
+            try:
+                proc.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                append_state_log(self.args.state_log, f"STREAM_STOP_KILL pid={proc.pid} reason={reason}")
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                try:
+                    proc.wait(timeout=1.0)
+                except Exception:
+                    pass
+            except Exception as e:
+                append_state_log(self.args.state_log, f"STREAM_STOP_WAIT_ERR {type(e).__name__}: {e}")
+            self.proc = None
+
+        # 兜底：扫所有挂在本 daemon 下的孤儿 arecord（self.proc 与 OS 状态可能漂移）
         try:
-            self.proc.terminate()
-        except Exception:
-            pass
-        try:
-            self.proc.wait(timeout=0.5)
-        except Exception:
-            pass
-        self.proc = None
+            my_pid = os.getpid()
+            ps_out = subprocess.run(
+                ["ps", "--ppid", str(my_pid), "-o", "pid=,comm="],
+                capture_output=True, text=True, timeout=2.0,
+            )
+            for line in ps_out.stdout.splitlines():
+                parts = line.split(None, 1)
+                if len(parts) < 2:
+                    continue
+                pid_str, comm = parts[0], parts[1].strip()
+                if comm != "arecord":
+                    continue
+                try:
+                    cpid = int(pid_str)
+                except ValueError:
+                    continue
+                append_state_log(self.args.state_log, f"STREAM_STOP_REAP_ORPHAN pid={cpid}")
+                try:
+                    os.kill(cpid, signal.SIGTERM)
+                except ProcessLookupError:
+                    continue
+                except Exception:
+                    pass
+                # 短等再 SIGKILL
+                for _ in range(20):
+                    try:
+                        os.kill(cpid, 0)
+                    except ProcessLookupError:
+                        break
+                    time.sleep(0.05)
+                else:
+                    try:
+                        os.kill(cpid, signal.SIGKILL)
+                    except Exception:
+                        pass
+                # reap 僵尸
+                try:
+                    os.waitpid(cpid, os.WNOHANG)
+                except ChildProcessError:
+                    pass
+        except Exception as e:
+            append_state_log(self.args.state_log, f"STREAM_STOP_REAP_ERR {type(e).__name__}: {e}")
+
         self.reset_capture_state()
         append_state_log(self.args.state_log, f"STREAM_STOP reason={reason}")
 
