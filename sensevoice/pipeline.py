@@ -27,6 +27,7 @@ from sensevoice.speaker.verifier import SpeakerVerifierGate
 from sensevoice.lexicon.project import ProjectLexicon
 from sensevoice.vad.stream import make_arecord_process
 from sensevoice.logging import append_state_log, append_jsonl_bounded
+from sensevoice.control_socket import ControlServer
 
 
 class SenseVoicePipeline:
@@ -57,6 +58,7 @@ class SenseVoicePipeline:
         self.conf_router: Optional[ConfidenceRouter] = None
         self.vad = None  # type: ignore[assignment]  # webrtcvad.Vad
         self.inject_mode_name: str = ""
+        self.control_server: Optional[ControlServer] = None
 
         # --- VAD 状态 ---
         self.frame_samples = int(args.sample_rate * args.frame_ms / 1000)
@@ -506,6 +508,16 @@ class SenseVoicePipeline:
         self.write_status(active=self.active, ready=False)
         self._setup_signals()
 
+        # 控制 socket 在模型加载前就 listen ——
+        # toggle 脚本的命令在加载期间也能进队列，主循环 ready 后立即消费。
+        # 替代 SIGHUP/USR2 + status 文件这套脏 IPC。
+        self.control_server = ControlServer(
+            get_state=self._control_get_state,
+            submit=self._control_submit,
+        )
+        self.control_server.start()
+        append_state_log(args.state_log, "CONTROL_SOCKET_LISTENING")
+
         self.model = load_model(args)
         self.model_ready = True
         append_state_log(args.state_log, "MODEL_READY")
@@ -655,6 +667,8 @@ class SenseVoicePipeline:
                 pass
             raise
         finally:
+            if self.control_server is not None:
+                self.control_server.stop()
             self.stop_capture("shutdown")
             if self.indicator:
                 self.indicator.on_shutdown()
@@ -665,6 +679,13 @@ class SenseVoicePipeline:
                 f.write("")
             append_state_log(args.state_log, "DAEMON_STOP")
         return 0
+
+    def _control_get_state(self) -> dict:
+        return {
+            "active": int(self.active),
+            "ready": int(self.model_ready),
+            "pid": os.getpid(),
+        }
 
     def _build_asr_context(self) -> str:
         """生成 Qwen3-ASR 的 context 字符串(读 config/hotwords.yaml 四组分类)。
@@ -684,3 +705,18 @@ class SenseVoicePipeline:
             return build_asr_context(yaml_path)
         except Exception:
             return ""
+
+    def _control_submit(self, cmd: str) -> dict:
+        # ACTIVATE/DEACTIVATE 直接设 force_active；TOGGLE 增计数。主循环每轮消费。
+        # 模型未 ready 时命令仍被接受（进入待处理状态），ready 后第一轮即生效。
+        if cmd == "ACTIVATE":
+            self.force_active = True
+        elif cmd == "DEACTIVATE":
+            self.force_active = False
+        elif cmd == "TOGGLE":
+            self.toggle_count += 1
+        return {
+            "active": int(self.active),
+            "ready": int(self.model_ready),
+            "queued": not self.model_ready,
+        }
