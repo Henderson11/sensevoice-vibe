@@ -18,6 +18,7 @@ from sensevoice.asr.confidence import _select_focus_low_tokens
 from sensevoice.config.settings import SenseVoiceConfig
 from sensevoice.asr.router import ConfidenceRouter
 from sensevoice.asr.model import load_model, transcribe_array, transcribe_array_with_conf
+from sensevoice.lexicon.hotwords import build_context as build_asr_context
 from sensevoice.inject.ibus import IBusInjector
 from sensevoice.inject.clipboard import FocusInjector
 from sensevoice.ui.indicator import SpeechIndicator
@@ -392,8 +393,10 @@ class SenseVoicePipeline:
                 append_state_log(args.state_log, f"SPK_AUTO_ENROLL_SKIP reason={add_info} score={spk_score:.3f} n={self.speaker_gate.enroll_count}")
 
         # 2. ASR 识别（只有声纹通过才执行）
+        #    qwen3asr-gpu 后端额外注入 4 组热词 context 做 biasing(其他后端忽略 context)
+        asr_context = self._build_asr_context()
         raw_final_text, native_conf_score, conf_source, native_token_scores = transcribe_array_with_conf(
-            self.model, samples, args.language
+            self.model, samples, args.language, context=asr_context
         )
         final_text = sanitize_transcript_text(raw_final_text, args.language, bool(args.filter_fillers))
         compare_rec["raw_asr"] = raw_final_text
@@ -590,7 +593,8 @@ class SenseVoicePipeline:
                 )
                 if args.emit_partial and should_partial:
                     samples = np.frombuffer(self.segment, dtype=np.int16).astype(np.float32) / 32768.0
-                    raw_text = transcribe_array(self.model, samples, args.language)
+                    raw_text = transcribe_array(self.model, samples, args.language,
+                                                context=self._build_asr_context())
                     text = sanitize_transcript_text(raw_text, args.language, bool(args.filter_fillers))
                     if raw_text and not text:
                         append_state_log(args.state_log, f"DROP_PARTIAL raw={raw_text}")
@@ -661,3 +665,22 @@ class SenseVoicePipeline:
                 f.write("")
             append_state_log(args.state_log, "DAEMON_STOP")
         return 0
+
+    def _build_asr_context(self) -> str:
+        """生成 Qwen3-ASR 的 context 字符串(读 config/hotwords.yaml 四组分类)。
+        非 qwen3asr-gpu 后端忽略此返回。yaml 缺失返回空串=不注入。
+        hotwords.py 内部按文件 mtime 缓存,反复调用零开销。
+        """
+        backend = (os.environ.get("SENSEVOICE_ASR_BACKEND") or "").lower()
+        if backend != "qwen3asr-gpu":
+            return ""
+        # 路径: <project_root>/config/hotwords.yaml
+        here = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        yaml_path = os.path.join(here, "config", "hotwords.yaml")
+        custom = os.environ.get("SENSEVOICE_ASR_CONTEXT_FILE", "").strip()
+        if custom:
+            yaml_path = os.path.expanduser(custom)
+        try:
+            return build_asr_context(yaml_path)
+        except Exception:
+            return ""

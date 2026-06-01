@@ -242,10 +242,13 @@ def _is_qwen3asr(model) -> bool:
     return isinstance(model, (Qwen3ASREngine, Qwen3ASRGPUClient))
 
 
-def transcribe_array(model, samples: np.ndarray, language: str) -> str:
+def transcribe_array(model, samples: np.ndarray, language: str, context: str = "") -> str:
     if samples.size == 0:
         return ""
     if _is_qwen3asr(model):
+        # 只有 GPU 客户端接受 context;本地 C 引擎接口不一样,context 在那边无效
+        if isinstance(model, Qwen3ASRGPUClient):
+            return model.transcribe_samples(samples, context=context)
         return model.transcribe_samples(samples)
     if _is_onnx_model(model):
         res = model(samples, language=language, textnorm="withitn")
@@ -269,16 +272,17 @@ def transcribe_array_with_conf(
     model,
     samples: np.ndarray,
     language: str,
+    context: str = "",
 ) -> Tuple[str, Optional[float], str, List[Dict[str, float]]]:
     # ONNX / Qwen3-ASR 模式下无法做 CTC 置信度计算，直接返回文本
     if _is_onnx_model(model) or _is_qwen3asr(model):
-        text = transcribe_array(model, samples, language)
+        text = transcribe_array(model, samples, language, context=context)
         source = "qwen3asr" if _is_qwen3asr(model) else "onnx"
         return text, None, source, []
     text, conf, source, token_scores = _native_ctc_confidence(model, samples, language)
     if text:
         return text, conf, source, token_scores
-    return transcribe_array(model, samples, language), None, source, []
+    return transcribe_array(model, samples, language, context=context), None, source, []
 
 
 class Qwen3ASRGPUClient:
@@ -287,7 +291,8 @@ class Qwen3ASRGPUClient:
     def __init__(self, url: str):
         self.url = url.rstrip("/")
 
-    def transcribe_samples(self, samples: np.ndarray, sample_rate: int = 16000) -> str:
+    def transcribe_samples(self, samples: np.ndarray, sample_rate: int = 16000,
+                           context: str = "") -> str:
         import wave, tempfile, urllib.request, json
 
         # 写临时 WAV
@@ -300,16 +305,31 @@ class Qwen3ASRGPUClient:
             wf.writeframes(pcm.tobytes())
 
         try:
-            # multipart/form-data 上传
+            # multipart/form-data 上传(audio file + 可选 context 字段)
             boundary = "----SenseVoiceBoundary"
             with open(tmp.name, "rb") as f:
                 wav_data = f.read()
 
-            body = (
-                f"--{boundary}\r\n"
-                f'Content-Disposition: form-data; name="file"; filename="audio.wav"\r\n'
-                f"Content-Type: audio/wav\r\n\r\n"
-            ).encode() + wav_data + f"\r\n--{boundary}--\r\n".encode()
+            parts: list[bytes] = []
+            # context 在前(form 字段顺序对 FastAPI 无影响,但调试时看 raw body 更清楚)
+            ctx = (context or "").strip()
+            if ctx:
+                parts.append(
+                    f"--{boundary}\r\n"
+                    f'Content-Disposition: form-data; name="context"\r\n\r\n'
+                    f"{ctx}\r\n".encode("utf-8")
+                )
+            parts.append(
+                (
+                    f"--{boundary}\r\n"
+                    f'Content-Disposition: form-data; name="file"; filename="audio.wav"\r\n'
+                    f"Content-Type: audio/wav\r\n\r\n"
+                ).encode("utf-8")
+                + wav_data
+                + b"\r\n"
+            )
+            parts.append(f"--{boundary}--\r\n".encode("utf-8"))
+            body = b"".join(parts)
 
             req = urllib.request.Request(
                 f"{self.url}/v1/audio/transcriptions",
