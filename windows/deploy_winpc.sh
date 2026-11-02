@@ -3,6 +3,7 @@
 #   ./deploy_winpc.sh            # 完整部署（首次会安装私有 Python）
 #   ./deploy_winpc.sh --sync     # 只同步代码+配置（不动 Python/依赖）
 #   ./deploy_winpc.sh --spk      # 同步 + 声纹门禁（torch/funasr/补丁/模型/注册模板）
+#   ... --force                  # 远端文件在上次部署后被直接改过时，仍然覆盖（默认中止）
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -17,6 +18,7 @@ case "${1:-}" in
   --sync) SYNC_ONLY=1; WITH_SPK=0 ;;   # 只同步代码+配置
   --spk)  SYNC_ONLY=1; WITH_SPK=1 ;;   # 同步 + 声纹（依赖/补丁/模型/注册模板）
 esac
+FORCE=0; [[ " $* " == *" --force "* ]] && FORCE=1
 SPK_ENROLL_SRC="${HOME}/.local/state/sensevoice-vibe/speaker_enroll.d"
 
 # 远程跑 PowerShell：用 -EncodedCommand 避开 cmd 的引号/管道吞字符问题
@@ -33,6 +35,31 @@ ps "hostname; whoami"
 echo "== 2. 建目录 =="
 ps "New-Item -ItemType Directory -Force '$REMOTE_DIR_WIN' | Out-Null; 'ok'"
 
+# 漂移检查：每次同步后把已部署文件的 sha256 写进 winpc 上的 .deploy_manifest，下次部署前先比对。
+# 远端文件被人直接改过就中止（2026-11-02 发生过：热键修复只存在于 winpc，差点被仓库旧版覆盖）。
+echo "== 2b. 漂移检查 =="
+DRIFT="$(ps "
+  \$m='$REMOTE_DIR_WIN\\.deploy_manifest'
+  if (-not (Test-Path \$m)) { 'NO_MANIFEST' } else {
+    Get-Content \$m | ForEach-Object {
+      \$h, \$n = \$_ -split ' ', 2
+      \$p = Join-Path '$REMOTE_DIR_WIN' \$n
+      if ((Test-Path \$p) -and ((Get-FileHash -Algorithm SHA256 \$p).Hash.ToLower() -ne \$h)) { 'DRIFT ' + \$n }
+    }
+  }" | tr -d '\r')"
+if [[ "$DRIFT" == *NO_MANIFEST* ]]; then
+  echo "远端还没有部署清单，跳过比对（本次部署后生成）"
+elif [[ "$DRIFT" == *DRIFT* ]]; then
+  echo "$DRIFT" | grep '^DRIFT'
+  if [[ $FORCE -eq 0 ]]; then
+    echo "上述远端文件在上次部署后被直接修改过：先把改动合回仓库；确认要丢弃远端修改再加 --force" >&2
+    exit 3
+  fi
+  echo "--force：覆盖上述远端修改"
+else
+  echo "无漂移"
+fi
+
 if [[ $SYNC_ONLY -eq 0 ]]; then
   echo "== 3. 安装私有 Python $PY_VER（用户级，装到 $REMOTE_DIR_WIN\\py312，不碰系统环境）=="
   ps "
@@ -48,7 +75,7 @@ if [[ $SYNC_ONLY -eq 0 ]]; then
 fi
 
 echo "== 4. 生成 config.env（从 llm.env 摘出需要的项；含 API Key，仅放在 winpc 本机）=="
-TMP_CFG="$(mktemp)"; trap 'rm -f "$TMP_CFG"' EXIT
+TMP_CFG="$(mktemp)"; TMP_MAN="$(mktemp)"; trap 'rm -f "$TMP_CFG" "$TMP_MAN"' EXIT
 python3 - "$LLM_ENV" "$HERE/config.example.env" > "$TMP_CFG" <<'PY'
 import re, sys
 llm, tmpl = sys.argv[1], sys.argv[2]
@@ -85,6 +112,13 @@ scp "${SSH_OPTS[@]}" -q \
 scp "${SSH_OPTS[@]}" -q "$TMP_CFG" "winpc:$REMOTE_DIR_SCP/config.env"
 # 共享的百炼 ASR 客户端（Linux/Windows 同一份源码，Windows 上叫 asr_bailian.py）
 scp "${SSH_OPTS[@]}" -q "$ROOT/sensevoice/asr/bailian.py" "winpc:$REMOTE_DIR_SCP/asr_bailian.py"
+# 部署清单：远端文件名 + 本次推上去的内容哈希，供下次部署做漂移检查
+DEPLOYED=("winvoice.py:$HERE/winvoice.py" "win_input.py:$HERE/win_input.py" "requirements.txt:$HERE/requirements.txt"
+          "run.bat:$HERE/run.bat" "run_console.bat:$HERE/run_console.bat" "stop.bat:$HERE/stop.bat"
+          "postprocessor.py:$ROOT/sensevoice/llm/postprocessor.py" "verifier.py:$ROOT/sensevoice/speaker/verifier.py"
+          "hotwords.yaml:$ROOT/config/hotwords.yaml" "asr_bailian.py:$ROOT/sensevoice/asr/bailian.py" "config.env:$TMP_CFG")
+for e in "${DEPLOYED[@]}"; do echo "$(sha256sum "${e#*:}" | cut -c1-64) ${e%%:*}"; done > "$TMP_MAN"
+scp "${SSH_OPTS[@]}" -q "$TMP_MAN" "winpc:$REMOTE_DIR_SCP/.deploy_manifest"
 ps "Get-ChildItem '$REMOTE_DIR_WIN' -File | Select-Object Name,Length | Format-Table -AutoSize | Out-String"
 
 if [[ $SYNC_ONLY -eq 0 ]]; then
