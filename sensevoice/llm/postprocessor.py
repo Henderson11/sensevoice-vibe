@@ -303,6 +303,13 @@ class LLMPostProcessor:
             self.reason = f"degraded:{self.last_error}"
 
     @staticmethod
+    def _finish_reason(obj: dict) -> str:
+        choices = obj.get("choices")
+        if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+            return str(choices[0].get("finish_reason") or "")
+        return ""
+
+    @staticmethod
     def _extract_text(obj: dict) -> str:
         choices = obj.get("choices")
         if isinstance(choices, list) and choices:
@@ -408,12 +415,18 @@ class LLMPostProcessor:
             },
         )
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout_sec) as resp:
+            # 长文本输出更久：超过 150 字的部分每字多给 3ms（实测网关 852 字整段润色 0.9s）
+            timeout_sec = self.timeout_sec + max(0, len(src) - 150) * 0.003
+            with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
                 raw = resp.read().decode("utf-8", errors="replace")
             obj = json.loads(raw)
             out = self._extract_text(obj).strip()
             if not out:
                 return "", "empty_output"
+            # 输出被 max_tokens 截断：宁可回退原文也不注入半截（2026-11-02 实测 852 字原文在
+            # max_tokens=96 下只回 175 字、finish_reason=length，旧逻辑会把这半截注入）
+            if self._finish_reason(obj) == "length":
+                return "", "truncated"
             return out, ""
         except urllib.error.HTTPError as e:
             body = ""
@@ -476,6 +489,9 @@ class LLMPostProcessor:
         req_max_tokens = self._choose_max_tokens(src)
         if route_tag == "low":
             req_max_tokens = min(self.max_tokens, int(req_max_tokens * 1.5) + 12)
+        # max_tokens 是防扩写的上限，但不能低于原文本身所需：中文约 1.8 字/token（2026-11-02 实测），
+        # 按 0.75 token/字 + 32 留余量，否则长段输出必被截断
+        req_max_tokens = max(req_max_tokens, int(len(src) * 0.75) + 32)
 
         now = time.time()
         if now < self._circuit_open_until:
