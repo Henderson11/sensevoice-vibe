@@ -91,6 +91,9 @@ class LLMPostProcessor:
         self.enabled = False
         self.reason = "off"
         self.last_error = ""
+        # 最近一次 process() 的结果，供调用方写日志：实际出结果的模型 / ok|fallback(..)|failed:..|跳过原因
+        self.last_model = ""
+        self.last_status = ""
         self.timeout_sec = max(0.2, float(timeout_ms) / 1000.0)
         self.max_tokens = max(32, int(max_tokens))
         self.temperature = float(temperature)
@@ -385,7 +388,9 @@ class LLMPostProcessor:
         # - GLM-5.x  用 chat_template_kwargs.enable_thinking
         # - Moonshot 官方 API 用顶层 thinking.type
         ml = (model_name or "").lower()
-        if any(k in ml for k in ("kimi", "glm", "qwen", "thinking", "reasoning", "deepseek-r")):
+        # deepseek 不只 -r 系列会思考：实测 DeepSeek-V4-Pro-0813 默认也输出
+        # reasoning 字段(16 token 预算能被思考过程吃光,content 直接为 null)。
+        if any(k in ml for k in ("kimi", "glm", "qwen", "thinking", "reasoning", "deepseek")):
             ctk = {}
             if "kimi" in ml:
                 ctk["thinking"] = False
@@ -450,16 +455,21 @@ class LLMPostProcessor:
         glossary: Optional[List[str]] = None,
         focus_tokens: Optional[List[str]] = None,
     ) -> str:
+        self.last_model, self.last_status = "", ""
         if not self.enabled:
+            self.last_status = "disabled"
             return text
         src = (text or "").strip()
         if not src:
+            self.last_status = "skip_empty"
             return text
         if len(src) < self.min_chars:
+            self.last_status = "skip_short"
             return text
         route_tag = route if route in ("high", "mid", "low") else "mid"
         if route_tag == "high" and self.mode not in {"polish_coding", "polish_coding_aggressive"}:
             self.last_error = "skip_high_conf"
+            self.last_status = "skip_high_conf"
             return text
 
         prompt = self._system_prompt(route_tag, glossary, focus_tokens)
@@ -471,11 +481,13 @@ class LLMPostProcessor:
         if now < self._circuit_open_until:
             remain = int(max(1, self._circuit_open_until - now))
             self.last_error = f"circuit_open:{remain}s"
+            self.last_status = self.last_error
             return text
 
         out, err = self._request_once(self.model, src, prompt, req_max_tokens)
         if out:
             self._note_success()
+            self.last_model, self.last_status = self.model, "ok"
             return out
 
         # 主模型失败（超时/错误）→ 立即切 fallback API，不重试
@@ -486,9 +498,12 @@ class LLMPostProcessor:
             )
             if out2:
                 self._note_success()
+                self.last_model, self.last_status = self.fallback_model, f"fallback(primary={err or 'failed'})"
                 return out2
             self._note_failure(f"primary:{err or 'failed'};fallback:{err2 or 'failed'}")
+            self.last_status = f"failed:{self.last_error}"
             return text
 
         self._note_failure(err or "failed")
+        self.last_status = f"failed:{self.last_error}"
         return text
