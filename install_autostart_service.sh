@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 安装 systemd user service，开机自启 SenseVoice 语音输入
+# 安装 systemd user service，开机自启语音输入 daemon
 # 所有配置从 ~/.config/sensevoice-vibe/llm.env 读取
 set -euo pipefail
 
@@ -14,7 +14,8 @@ mkdir -p "$(dirname "$LLM_ENV")"
 
 # 如果配置文件不存在，从模板复制
 if [[ ! -f "$LLM_ENV" ]]; then
-  cp "$ROOT_DIR/config/llm.env.example" "$LLM_ENV"
+  sed -e "s|__INSTALL_DIR__|$ROOT_DIR|g" "$ROOT_DIR/config/llm.env.example" > "$LLM_ENV"
+  chmod 600 "$LLM_ENV"
   echo "Created config: $LLM_ENV"
   echo "Please edit it to fill in API keys before starting the service."
 fi

@@ -1,85 +1,73 @@
 #!/usr/bin/env bash
-# SenseVoice 语音输入系统 - 一键安装脚本（系统检查 + setup.sh + 模型 + IBus + F8）
+# 一键安装：系统依赖检查 → Python 环境 → 声纹模型 → 配置文件 → IBus 引擎 → 快捷键（F8 / Shift+F8）
+# 开机自启另跑 ./install_autostart_service.sh
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VENV_DIR="$ROOT_DIR/.venv"
 CONFIG_DIR="$HOME/.config/sensevoice-vibe"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/sensevoice-vibe"
 
-echo "========================================="
-echo " SenseVoice 语音输入系统 - 一键安装"
-echo "========================================="
-
-# --- 1. 系统依赖检查 ---
-echo ""
-echo "[1/7] 检查系统依赖..."
+echo "[1/6] 检查系统依赖"
 missing=()
-command -v python3 >/dev/null 2>&1 || missing+=("python3")
+command -v python3 >/dev/null 2>&1 || missing+=("python3 python3-venv")
 command -v arecord >/dev/null 2>&1 || missing+=("alsa-utils")
 command -v ibus >/dev/null 2>&1 || missing+=("ibus")
-/usr/bin/python3 -c "from gi.repository import IBus" >/dev/null 2>&1 \
-  || missing+=("python3-gi gir1.2-ibus-1.0")
-
+/usr/bin/python3 -c "from gi.repository import IBus" >/dev/null 2>&1 || missing+=("python3-gi gir1.2-ibus-1.0")
+command -v notify-send >/dev/null 2>&1 || missing+=("libnotify-bin")
+command -v zenity >/dev/null 2>&1 || missing+=("zenity")
 if [[ ${#missing[@]} -gt 0 ]]; then
-  echo "  缺少系统依赖: ${missing[*]}"
-  echo "  请先安装: sudo apt install -y ${missing[*]}"
+  echo "  缺少: ${missing[*]}"
+  echo "  请先执行: sudo apt install -y ${missing[*]}"
   exit 1
 fi
-echo "  系统依赖检查通过 ✓"
+command -v wl-copy >/dev/null 2>&1 || echo "  提示: 未装 wl-clipboard，最近语音面板的\"复制文字\"不可用"
 
-# --- 2. Python venv + 依赖 + funasr patch ---
-echo ""
-echo "[2/7] 装 Python 依赖（调用 setup.sh）..."
-bash "$ROOT_DIR/setup.sh"
+echo "[2/6] Python 环境（.venv）"
+[[ -d "$VENV_DIR" ]] || python3 -m venv "$VENV_DIR"
+"$VENV_DIR/bin/python" -m pip install -q -U pip setuptools wheel
+# 声纹模型只需 CPU 版 PyTorch
+"$VENV_DIR/bin/python" -m pip install -q torch==2.10.0+cpu torchaudio==2.10.0+cpu \
+  --index-url https://download.pytorch.org/whl/cpu
+grep -vE "^(torch|torchaudio)==" "$ROOT_DIR/requirements.txt" | "$VENV_DIR/bin/python" -m pip install -q -r /dev/stdin
+# ERes2NetV2 不在 FunASR 发行版里，拷入补丁并注册
+FUNASR_ERES2NET="$("$VENV_DIR/bin/python" -c \
+  "import importlib.util as u, os; print(os.path.join(list(u.find_spec('funasr').submodule_search_locations)[0], 'models', 'eres2net'))")"
+cp "$ROOT_DIR/sensevoice/speaker/funasr_patch/eres2netv2.py" "$ROOT_DIR/sensevoice/speaker/funasr_patch/pooling_layers.py" "$FUNASR_ERES2NET/"
+grep -q "eres2netv2" "$FUNASR_ERES2NET/__init__.py" 2>/dev/null \
+  || echo "from funasr.models.eres2net.eres2netv2 import ERes2NetV2  # noqa" >> "$FUNASR_ERES2NET/__init__.py"
+"$VENV_DIR/bin/python" -c "import funasr, torch, webrtcvad, numpy, requests, yaml, dashscope; print('  Python 依赖 ok')"
 
-# --- 3. 模型下载 ---
-echo ""
-echo "[3/7] 下载模型（~1.2GB，已存在则跳过）..."
+echo "[3/6] 声纹模型"
 bash "$ROOT_DIR/download_models.sh"
 
-# --- 4. 配置文件 ---
-echo ""
-echo "[4/7] 配置文件..."
-mkdir -p "$CONFIG_DIR" "$STATE_DIR"
+echo "[4/6] 配置文件"
+mkdir -p "$CONFIG_DIR" "$STATE_DIR/speaker_enroll.d"
 if [[ ! -f "$CONFIG_DIR/llm.env" ]]; then
-  cp "$ROOT_DIR/config/llm.env.example" "$CONFIG_DIR/llm.env"
-  # 自动填入仓库内模型绝对路径
-  sed -i "s|^SENSEVOICE_MODEL=.*|SENSEVOICE_MODEL=$ROOT_DIR/models/sensevoice-small|" "$CONFIG_DIR/llm.env"
-  sed -i "s|^SENSEVOICE_SPK_MODEL=.*|SENSEVOICE_SPK_MODEL=$ROOT_DIR/models/eres2netv2|" "$CONFIG_DIR/llm.env"
-  sed -i "s|^SENSEVOICE_SPK_CACHE_DIR=.*|SENSEVOICE_SPK_CACHE_DIR=$ROOT_DIR/models/eres2netv2|" "$CONFIG_DIR/llm.env"
-  sed -i "s|^SENSEVOICE_PROJECT_ROOT=.*|SENSEVOICE_PROJECT_ROOT=$HOME|" "$CONFIG_DIR/llm.env"
-  echo "  配置文件已创建: $CONFIG_DIR/llm.env"
-  echo "  ⚠ 请编辑填入 LLM API key；如要纯本地模式可设 SENSEVOICE_POST_LLM_ENABLE=0"
+  sed -e "s|__INSTALL_DIR__|$ROOT_DIR|g" "$ROOT_DIR/config/llm.env.example" > "$CONFIG_DIR/llm.env"
+  echo "  已创建 $CONFIG_DIR/llm.env —— 需填入百炼 API Key 和润色用的 LLM 配置"
 else
-  echo "  配置文件已存在，跳过: $CONFIG_DIR/llm.env"
+  echo "  已存在，跳过: $CONFIG_DIR/llm.env"
 fi
 chmod 600 "$CONFIG_DIR/llm.env"
 
-# --- 5. IBus 引擎 ---
-echo ""
-echo "[5/7] 装 IBus 引擎..."
+echo "[5/6] IBus 引擎（需要 sudo）"
 bash "$ROOT_DIR/install_ibus_engine.sh"
 
-# --- 6. F8 快捷键 ---
-echo ""
-echo "[6/7] 配置 F8 快捷键..."
+echo "[6/6] 快捷键"
 if command -v gsettings >/dev/null 2>&1; then
   bash "$ROOT_DIR/configure_f8.sh"
 else
-  echo "  非 GNOME 环境，跳过自动配置。"
-  echo "  请手动绑定快捷键调用: $ROOT_DIR/toggle_resident_f8.sh toggle"
+  echo "  非 GNOME 环境，请手动绑定："
+  echo "    F8       → $ROOT_DIR/toggle_resident_f8.sh toggle"
+  echo "    Shift+F8 → $VENV_DIR/bin/python $ROOT_DIR/recent_voice.py"
 fi
 
-# --- 7. 完成 ---
-echo ""
-echo "========================================="
-echo " ✓ 安装完成"
-echo "========================================="
-echo ""
-echo "下一步："
-echo "  1) 编辑 $CONFIG_DIR/llm.env 填入 LLM API key（可选）"
-echo "  2) 录声纹: ./enroll_speaker_f8.sh"
-echo "  3) 启动:   ./toggle_resident_f8.sh on"
-echo "  4) 按 F8 开始语音输入"
-echo ""
-echo "可选: ./install_autostart_service.sh   # 开机自启"
+cat <<EOF
+
+安装完成。接下来：
+  1) 编辑 $CONFIG_DIR/llm.env，填入 SENSEVOICE_BAILIAN_API_KEY 与 SENSEVOICE_POST_LLM_*
+  2) 录声纹：./enroll_speaker_f8.sh            （正常说话 20 秒）
+  3) 开机自启并启动：./install_autostart_service.sh
+  4) 按 F8 开关收音；Shift+F8 查看最近语音
+EOF
