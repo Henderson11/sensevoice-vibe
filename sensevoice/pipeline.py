@@ -727,14 +727,25 @@ class SenseVoicePipeline:
     def _control_submit(self, cmd: str) -> dict:
         # ACTIVATE/DEACTIVATE 直接设 force_active；TOGGLE 增计数。主循环每轮消费。
         # 模型未 ready 时命令仍被接受（进入待处理状态），ready 后第一轮即生效。
+        #
+        # 注意: 这里返回的 active 必须是"这条命令生效后"的预测值，不能是
+        # self.active 本身 —— self.active 要等主循环下一轮才会真正翻转，
+        # 命令刚排进队列的这一刻它还是旧值。之前直接返回 self.active 导致
+        # toggle_resident_f8.sh 的 ON/OFF 提示永远落后一步、看起来像是反的
+        # (按下去要开，提示却说关；再按一次要关，提示又说开)。
         if cmd == "ACTIVATE":
             self.force_active = True
+            predicted_active = True
         elif cmd == "DEACTIVATE":
             self.force_active = False
+            predicted_active = False
         elif cmd == "TOGGLE":
             self.toggle_count += 1
+            predicted_active = not self.active
+        else:
+            predicted_active = self.active
         return {
-            "active": int(self.active),
+            "active": int(predicted_active),
             "ready": int(self.model_ready),
             "queued": not self.model_ready,
         }
