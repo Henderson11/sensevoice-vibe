@@ -70,7 +70,8 @@ class RecentStore:
         os.replace(tmp, self.index_path)
 
     def _prune(self, entries: List[Dict], now: float) -> List[Dict]:
-        keep = [e for e in entries if now - float(e.get("ts", 0)) <= self.max_age_sec]
+        keep = [e for e in entries if now - float(e.get("ts", 0)) <= self.max_age_sec
+                and os.path.exists(os.path.join(self.root, e.get("wav", "")))]  # 录音被外部删掉的记录一并去掉
         ok_ids = [e["id"] for e in keep if e.get("status") == "ok"]
         if len(ok_ids) > self.max_ok:
             drop = set(ok_ids[: len(ok_ids) - self.max_ok])  # 正常输入的只留最近 max_ok 条，不挤掉失败记录
@@ -111,7 +112,7 @@ class RecentStore:
     def get(self, eid: str) -> Optional[Dict]:
         with self._lock:
             for e in load_entries(self.root):
-                if e.get("id") == eid:
+                if e.get("id") == eid and os.path.exists(os.path.join(self.root, e.get("wav", ""))):
                     return e
         return None
 
