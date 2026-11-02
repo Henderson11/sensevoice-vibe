@@ -22,7 +22,8 @@ MAX_ROWS = 20
 
 def rows():
     out = []
-    for e in reversed(load_entries(ROOT)[-MAX_ROWS:]):
+    live = [e for e in load_entries(ROOT) if os.path.exists(os.path.join(ROOT, e.get("wav", "")))]
+    for e in reversed(live[-MAX_ROWS:]):
         score = e.get("spk_score")
         out.append({
             "id": e["id"], "time": e.get("time", ""), "dur": f"{e.get('seg_ms', 0) / 1000:.1f}s",

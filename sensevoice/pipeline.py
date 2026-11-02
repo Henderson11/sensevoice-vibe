@@ -1,5 +1,6 @@
 """SenseVoice 语音输入管线 - 协调所有子系统的主循环"""
 import collections
+import concurrent.futures
 import json
 import os
 import queue
@@ -74,6 +75,12 @@ class SenseVoicePipeline:
         self.pre_roll_frames = max(0, int(args.pre_roll_ms / args.frame_ms))
         self.proc: Optional[subprocess.Popen] = None
         self._frame_q: Optional["queue.Queue[Optional[bytes]]"] = None
+        # 声纹逐窗复核：说话过程中每满一窗就交给后台算分，段结束时只剩不满一窗的尾巴。
+        # 所有声纹计算都走这个单线程池，避免多线程同时调用声纹模型。
+        self._spk_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="spk")
+        self._spk_win_bytes = max(0, int(args.spk_window_ms * args.sample_rate * 2 / 1000))
+        self._spk_futs: List[concurrent.futures.Future] = []
+        self._spk_win_done = 0
         # 最近语音备份 + 重试队列（通知按钮 / 控制 socket 的 RETRY 都排进这里，由主循环处理）
         self._retry_q: "queue.Queue[str]" = queue.Queue()
         self.recent: Optional[RecentStore] = None
@@ -226,6 +233,7 @@ class SenseVoicePipeline:
         self.speech_frames = 0
         self.trailing_silence = 0
         self.segment = bytearray()
+        self._spk_futs, self._spk_win_done = [], 0
         self.last_partial_ts = 0.0
         self.last_partial_text = ""
         self.prev_partial_hyp = ""
@@ -381,7 +389,45 @@ class SenseVoicePipeline:
             signal.signal(signal.SIGHUP, _deactivate)
         append_state_log(self.args.state_log, f"SIGNAL_TRAPS_INSTALLED faulthandler={fault_log_path}")
 
-    def _process_finalized_segment(self, samples: np.ndarray, seg_ms: float, retry_entry: Optional[Dict] = None):
+    def _spk_score_window(self, pcm: bytes) -> Tuple[float, float, float]:
+        """后台线程：算一窗的声纹分数，返回 (score, 当前阈值, 窗长 ms)。"""
+        x = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+        ms = len(x) * 1000.0 / self.args.sample_rate
+        _, score, _, thr = self.speaker_gate.verify(x, self.args.sample_rate, ms)
+        return float(score), float(thr), ms
+
+    def _verify_speaker(self, samples: np.ndarray, seg_ms: float, spk_windows, compare_rec: Dict):
+        """声纹判定。有逐窗结果时：补算尾巴（≥1s）后按时长加权平均；均值落在 [阈值-gray, 阈值) 的灰区
+        回退整段判定，保证临界情况的结论与整段判定一致。返回 (ok, score, reason, thr)。"""
+        args = self.args
+        t0 = time.time()
+        mode = "whole"
+        if spk_windows:
+            futs, tail = spk_windows
+            try:
+                if len(tail) >= args.sample_rate * 2:  # 不足 1s 的尾巴声纹不稳，不计入
+                    futs = futs + [self._spk_pool.submit(self._spk_score_window, tail)]
+                res = [f.result() for f in futs]
+                score = sum(s * ms for s, _, ms in res) / sum(ms for _, _, ms in res)
+                thr = res[-1][1]
+                compare_rec["spk_windows"] = [round(s, 3) for s, _, _ in res]
+                append_state_log(args.state_log, f"SPK_WINDOWS n={len(res)} mean={score:.3f} "
+                                                 f"scores=[{' '.join(f'{s:.2f}' for s, _, _ in res)}]")
+                if score >= thr or score < thr - args.spk_window_gray:
+                    ok = score >= thr
+                    reason = ("pass" if score >= self.speaker_gate.threshold else "pass_adapt") if ok else "below_threshold"
+                    append_state_log(args.state_log, f"SPK_TIME mode=windows wait_ms={int((time.time() - t0) * 1000)}")
+                    return ok, score, reason, thr
+                mode = "gray_whole"
+            except Exception as e:
+                append_state_log(args.state_log, f"SPK_WINDOWS_ERROR {type(e).__name__}: {e}", level="WARN")
+                mode = "error_whole"
+        ok, score, reason, thr = self._spk_pool.submit(self.speaker_gate.verify, samples, args.sample_rate, seg_ms).result()
+        append_state_log(args.state_log, f"SPK_TIME mode={mode} wait_ms={int((time.time() - t0) * 1000)}")
+        return ok, score, reason, thr
+
+    def _process_finalized_segment(self, samples: np.ndarray, seg_ms: float, retry_entry: Optional[Dict] = None,
+                                   spk_windows=None):
         """处理已结束的语音段：声纹 → ASR → LLM → 注入。retry_entry 非空 = 用户手动重试一条最近语音，跳过声纹。"""
         assert self.speaker_gate is not None
         assert self.post_llm is not None
@@ -411,7 +457,7 @@ class SenseVoicePipeline:
             spk_thr = float(self.speaker_gate.threshold)
             compare_rec["retry_of"] = retry_entry.get("id", "")
         else:
-            spk_ok, spk_score, spk_reason, spk_thr = self.speaker_gate.verify(samples, args.sample_rate, seg_ms)
+            spk_ok, spk_score, spk_reason, spk_thr = self._verify_speaker(samples, seg_ms, spk_windows, compare_rec)
         compare_rec["spk_pass"] = int(spk_ok)
         compare_rec["spk_score"] = round(float(spk_score), 4)
         compare_rec["spk_thr"] = round(float(spk_thr), 4)
@@ -640,6 +686,8 @@ class SenseVoicePipeline:
             append_state_log(args.state_log, f"CONFIG_WARN {w}", level="WARN")
 
         self._init_components()
+        if not (self.speaker_gate.requested and self.speaker_gate.enabled):
+            self._spk_win_bytes = 0  # 没开声纹门禁就不做逐窗计算
         assert self.indicator is not None
         assert self.injector is not None
         assert self.vad is not None
@@ -728,6 +776,7 @@ class SenseVoicePipeline:
                             self.segment_id += 1
                             self.trailing_silence = 0
                             self.segment = bytearray(b"".join(self.pre_roll))
+                            self._spk_futs, self._spk_win_done = [], 0
                             self.last_partial_ts = 0.0
                             self.last_partial_text = ""
                             self.prev_partial_hyp = ""
@@ -740,6 +789,10 @@ class SenseVoicePipeline:
                     continue
 
                 self.segment.extend(chunk)
+                if self._spk_win_bytes and len(self.segment) - self._spk_win_done >= self._spk_win_bytes:
+                    win = bytes(self.segment[self._spk_win_done:self._spk_win_done + self._spk_win_bytes])
+                    self._spk_win_done += self._spk_win_bytes
+                    self._spk_futs.append(self._spk_pool.submit(self._spk_score_window, win))
                 if is_voiced:
                     self.trailing_silence = 0
                 else:
@@ -795,7 +848,10 @@ class SenseVoicePipeline:
 
                 if seg_ms >= args.min_segment_ms:
                     samples = np.frombuffer(self.segment, dtype=np.int16).astype(np.float32) / 32768.0
-                    self._process_finalized_segment(samples, seg_ms)
+                    # 尾巴去掉句末判停用的静音帧，否则静音占了尾巴大头、把该窗分数拉低
+                    voiced_end = max(self._spk_win_done, len(self.segment) - self.trailing_silence * self.frame_bytes)
+                    spk_windows = (self._spk_futs, bytes(self.segment[self._spk_win_done:voiced_end])) if self._spk_futs else None
+                    self._process_finalized_segment(samples, seg_ms, spk_windows=spk_windows)
 
                 self.indicator.on_speech_end()
                 append_state_log(args.state_log, "SPEECH_END")

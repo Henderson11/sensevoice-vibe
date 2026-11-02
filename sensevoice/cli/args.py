@@ -513,6 +513,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--recent-spk-min-score", type=float,
                    default=float(os.environ.get("SENSEVOICE_RECENT_SPK_MIN_SCORE", "0.40")),
                    help="Speaker-rejected segments scoring at least this are kept (lower = almost always others)")
+    # 声纹逐窗复核：说话过程中每满 SPK_WINDOW_MS 就在后台算该窗分数，段结束时只剩尾巴要算；0=关闭（整段判定）
+    p.add_argument("--spk-window-ms", type=int, default=int(os.environ.get("SENSEVOICE_SPK_WINDOW_MS", "5000")))
+    p.add_argument("--spk-window-gray", type=float, default=float(os.environ.get("SENSEVOICE_SPK_WINDOW_GRAY", "0.08")),
+                   help="Window-mean score within [thr-gray, thr) falls back to whole-segment verification")
     p.add_argument("--recent-notify-min-ms", type=int,
                    default=int(os.environ.get("SENSEVOICE_RECENT_NOTIFY_MIN_MS", "5000")),
                    help="Speaker-rejected kept segments at least this long pop a notification with a retry button")

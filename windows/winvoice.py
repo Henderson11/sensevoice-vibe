@@ -277,6 +277,10 @@ class Engine:
         self.audio_q: "queue.Queue[bytes]" = queue.Queue(maxsize=2000)
         self.stream = None
         self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="proc")
+        # 声纹逐窗复核（与 Linux 版同逻辑）：说话过程中每满一窗就后台算分；所有声纹计算走这个单线程池
+        self._spk_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="spk")
+        self._spk_win_bytes = max(0, env_int("SENSEVOICE_SPK_WINDOW_MS", 5000) * SR * 2 // 1000)
+        self._spk_gray = env_float("SENSEVOICE_SPK_WINDOW_GRAY", 0.08)
         self.post = None  # 后台线程构建（含预热探测），好了才参与润色
         # 声纹门禁（复用 Linux 版 verifier.py）。加载要几秒，放后台；加载完之前到来的句子会等它。
         self.spk = None
@@ -370,6 +374,7 @@ class Engine:
         self.trailing = 0
         self.segment = bytearray()
         self.pre_roll = collections.deque(maxlen=self.pre_roll_frames)
+        self._spk_futs, self._spk_win_done = [], 0
 
     def _audio_cb(self, indata, frames, t, status):
         if status:
@@ -476,22 +481,61 @@ class Engine:
                 log("SPEECH_START")
             return
         self.segment.extend(frame)
+        if (self._spk_win_bytes and self.spk is not None
+                and len(self.segment) - self._spk_win_done >= self._spk_win_bytes):
+            win = bytes(self.segment[self._spk_win_done:self._spk_win_done + self._spk_win_bytes])
+            self._spk_win_done += self._spk_win_bytes
+            self._spk_futs.append(self._spk_pool.submit(self._spk_score_window, win))
         self.trailing = 0 if voiced else self.trailing + 1
         seg_ms = len(self.segment) * 1000 // (SR * 2)
         end_frames = self.soft_cut_frames if seg_ms >= self.soft_cut_start_ms else self.end_frames
         if self.trailing >= end_frames or seg_ms >= self.max_segment_ms:
             seg = bytes(self.segment)
+            # 尾巴去掉句末判停用的静音帧
+            voiced_end = max(self._spk_win_done, len(self.segment) - self.trailing * FRAME_BYTES)
+            spk_windows = (self._spk_futs, bytes(self.segment[self._spk_win_done:voiced_end])) if self._spk_futs else None
             self._reset_segmenter()
             if seg_ms >= self.min_segment_ms:
-                self.pool.submit(self._process, seg, seg_ms)
+                self.pool.submit(self._process, seg, seg_ms, spk_windows)
             if seg_ms >= self.max_segment_ms:
                 log(f"SEG_MAX_CUT seg_ms={seg_ms}")
             elif seg_ms >= self.soft_cut_start_ms:
                 log(f"SEG_SOFT_CUT seg_ms={seg_ms}")
             log("SPEECH_END")
 
+    def _spk_score_window(self, pcm: bytes):
+        x = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+        ms = len(x) * 1000.0 / SR
+        _, score, _, thr = self.spk.verify(x, SR, ms)
+        return float(score), float(thr), ms
+
+    def _verify_speaker(self, samples, seg_ms, spk_windows):
+        """有逐窗结果时：补算尾巴（≥1s）后按时长加权平均；均值落在 [阈值-gray, 阈值) 回退整段判定。"""
+        t0 = time.time()
+        mode = "whole"
+        if spk_windows:
+            futs, tail = spk_windows
+            try:
+                if len(tail) >= SR * 2:
+                    futs = futs + [self._spk_pool.submit(self._spk_score_window, tail)]
+                res = [f.result() for f in futs]
+                score = sum(s * ms for s, _, ms in res) / sum(ms for _, _, ms in res)
+                thr = res[-1][1]
+                log(f"SPK_WINDOWS n={len(res)} mean={score:.3f} scores=[{' '.join(f'{s:.2f}' for s, _, _ in res)}]")
+                if score >= thr or score < thr - self._spk_gray:
+                    ok = score >= thr
+                    log(f"SPK_TIME mode=windows wait_ms={int((time.time() - t0) * 1000)}")
+                    return ok, score, ("pass" if ok else "below_threshold"), thr
+                mode = "gray_whole"
+            except Exception as e:
+                log(f"SPK_WINDOWS_ERROR {type(e).__name__}: {e}")
+                mode = "error_whole"
+        ok, score, reason, thr = self._spk_pool.submit(self.spk.verify, samples, SR, seg_ms).result()
+        log(f"SPK_TIME mode={mode} wait_ms={int((time.time() - t0) * 1000)}")
+        return ok, score, reason, thr
+
     # ---- 一段话的处理：ASR → 润色 → 注入（单线程串行，保证顺序）
-    def _process(self, seg: bytes, seg_ms: int):
+    def _process(self, seg: bytes, seg_ms: int, spk_windows=None):
         t0 = time.time()
         try:
             samples = np.frombuffer(seg, dtype=np.int16).astype(np.float32) / 32768.0
@@ -501,7 +545,7 @@ class Engine:
                 if self.spk is None or not self.spk.enabled:
                     log("DROP_SPK_UNAVAILABLE 声纹门禁未就绪，按 fail-closed 丢弃该段")
                     return
-                ok, spk_score, reason, thr = self.spk.verify(samples, SR, seg_ms)
+                ok, spk_score, reason, thr = self._verify_speaker(samples, seg_ms, spk_windows)
                 if not ok:
                     log(f"DROP_FINAL_SPK score={spk_score:.3f} thr={thr:.3f} reason={reason} "
                         f"spk_ms={int((time.time()-t0)*1000)}")
