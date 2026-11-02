@@ -357,6 +357,7 @@ sed -i 's/^SENSEVOICE_POST_LLM_ENABLE=.*/SENSEVOICE_POST_LLM_ENABLE=0/' \
 | LLM 调用超时 | 网络慢 / 服务过载 | `POST_LLM_TIMEOUT_MS` 加大；或换 fallback URL |
 | 改了 `llm.env` 不生效 | 配置在进程启动时载入内存 | `./toggle_resident_f8.sh restart`（按 F8 也会触发：脚本检测到 `llm.env` mtime 比进程新会自动重启） |
 | 说话半截就出字 | VAD endpoint 太短 | `SENSEVOICE_STREAM_ENDPOINT_MS` 加大（默认 1500） |
+| daemon 启动即退出，日志 `no enroll wav found` | 声纹注册模板被删（2026-11-02：`retention_housekeep.sh` 曾按时间只留最新 20 个 wav，新增的 recent_audio 录音把模板挤掉） | 清理脚本已排除 `speaker_enroll*` 与 `recent_audio/`；模板从备份拷回 `speaker_enroll.d/` 后 `systemctl --user reset-failed sensevoice-vibe && systemctl --user start sensevoice-vibe` |
 | 长句被切两段 | 停顿超过 ENDPOINT_MS，或段长到了 MAX_SEGMENT（默认 180000，上限前 20s 内会在短停顿处软切） | 调大 `SENSEVOICE_STREAM_ENDPOINT_MS` 或 `SENSEVOICE_STREAM_MAX_SEGMENT_MS` |
 | 旁人说话也被识别 | 声纹门禁阈值太低 | `SENSEVOICE_SPK_THRESHOLD` 提高（如 0.6 → 0.7） |
 
