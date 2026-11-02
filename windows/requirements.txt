@@ -1,0 +1,5 @@
+numpy
+requests
+pyyaml
+sounddevice
+webrtcvad-wheels
