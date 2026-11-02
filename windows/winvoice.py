@@ -243,7 +243,7 @@ class Engine:
         self.asr = BailianASRClient(
             api_key=os.environ.get("SENSEVOICE_BAILIAN_API_KEY", ""),
             url=os.environ.get("SENSEVOICE_BAILIAN_URL", ""),
-            model=os.environ.get("SENSEVOICE_BAILIAN_MODEL", "qwen-audio-3.0-asr-flash"),
+            model=os.environ.get("SENSEVOICE_BAILIAN_MODEL", "qwen-audio-3.1-asr-flash"),
             hotwords_yaml_path=os.environ.get("WINVOICE_HOTWORDS", os.path.join(HERE, "hotwords.yaml")),
             # 对冲：主模型 hedge_after 内没回，就并发发给备用模型，谁先成功用谁（与 Linux 版同一份代码）
             hedge_models=[m for m in os.environ.get(

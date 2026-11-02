@@ -166,7 +166,8 @@ class BailianASRClient:
                     {"type": "input_audio", "input_audio": {"data": data_uri}}]}]},
                 "parameters": {"format": "wav", "sample_rate": "16000"},
             }
-            if model.startswith("qwen-audio-3.0"):  # 只有它支持即时热词
+            # qwen-audio-3.x 支持即时热词（3.1 实测带上 37 条热词每次请求多计 127 输入 token，确认被读入）
+            if model.startswith(("qwen-audio-3.0", "qwen-audio-3.1")):
                 vocab = self._vocabulary()
                 if vocab:
                     payload["parameters"]["vocabulary"] = vocab
