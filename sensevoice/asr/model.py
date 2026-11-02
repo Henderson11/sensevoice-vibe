@@ -56,6 +56,9 @@ def load_model(args: argparse.Namespace):
             timeout_sec=float(os.environ.get("SENSEVOICE_BAILIAN_TIMEOUT_SEC", "15")),
             timeout_ratio=float(os.environ.get("SENSEVOICE_BAILIAN_TIMEOUT_RATIO", "0.35")),
             hedge_after_ratio=float(os.environ.get("SENSEVOICE_BAILIAN_HEDGE_AFTER_RATIO", "0.1")),
+            workspace=os.environ.get("SENSEVOICE_BAILIAN_WORKSPACE", ""),
+            context_turns=int(os.environ.get("SENSEVOICE_BAILIAN_CONTEXT_TURNS", "3")),
+            context_max_chars=int(os.environ.get("SENSEVOICE_BAILIAN_CONTEXT_MAX_CHARS", "300")),
         )
     if backend == "qwen3asr":
         return Qwen3ASREngine(

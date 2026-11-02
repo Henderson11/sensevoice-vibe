@@ -3,3 +3,4 @@ requests
 pyyaml
 sounddevice
 webrtcvad-wheels
+dashscope>=2.0.1

@@ -252,6 +252,9 @@ class Engine:
             timeout_sec=env_float("SENSEVOICE_BAILIAN_TIMEOUT_SEC", 15),
             timeout_ratio=env_float("SENSEVOICE_BAILIAN_TIMEOUT_RATIO", 0.35),
             hedge_after_ratio=env_float("SENSEVOICE_BAILIAN_HEDGE_AFTER_RATIO", 0.1),
+            workspace=os.environ.get("SENSEVOICE_BAILIAN_WORKSPACE", ""),
+            context_turns=env_int("SENSEVOICE_BAILIAN_CONTEXT_TURNS", 3),
+            context_max_chars=env_int("SENSEVOICE_BAILIAN_CONTEXT_MAX_CHARS", 300),
             logger=lambda m: log(m),
         )
         self.vad = webrtcvad.Vad(env_int("SENSEVOICE_STREAM_VAD_AGGRESSIVENESS", 2))
@@ -531,6 +534,8 @@ class Engine:
                 polish += f" polish_model={self.post.last_model or '-'}"
             t_llm = time.time()
             ok = self._inject(text)
+            if ok:
+                self.asr.remember(text)  # 百炼 *-message：作为下一句的前文
             t_end = time.time()
             if spk_score is not None:
                 self.spk.on_success(spk_score, seg_ms, text)

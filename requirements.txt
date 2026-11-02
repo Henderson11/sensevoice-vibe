@@ -18,3 +18,6 @@ torchaudio==2.10.0+cpu
 
 # 数值计算
 numpy>=2.0
+
+# 百炼 qwen-audio-3.1-asr-flash-message（WebSocket）。只用普通版 / 本地模型时可不装
+dashscope>=2.0.1

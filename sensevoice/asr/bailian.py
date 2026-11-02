@@ -8,9 +8,12 @@ Windows 的 WinVoice 共用这同一份文件（Windows 部署时拷成 asr_bail
   几十分钟（2026-10-15 实测 14 次里 11 次 >5s，还有一句 15s 超时被丢）。客户端没法修，
   只能让系统扛得住：主模型 hedge_after 秒内没回，就并发再发一份给备用模型，谁先成功用谁。
 
-模型 → 协议（按名字前缀自动选择）：
+模型 → 协议（按名字自动选择）：
+  *-message（qwen-audio-3.1-asr-flash-message）→ DashScope WebSocket（需 dashscope>=2.0.1，用到时才 import）
   qwen-audio-* / fun-asr-*  → DashScope 原生 multimodal-generation
   其它(qwen3-asr-flash 等)   → OpenAI 兼容 chat/completions
+前文上下文：只有 *-message 支持。调用方每成功输入一句就 remember(text)，下一句识别时把最近几句
+  打包成"一问一答"的一轮传给 input.context（只有用户消息没有助手回复的上下文会被服务端忽略）。
 热词：
   qwen-audio-3.0-*  → parameters.vocabulary 按分类加权（common_errors=超级热词 50）
   兼容协议模型      → system message 自然语言 context（≤200 字）
@@ -20,6 +23,7 @@ Windows 的 WinVoice 共用这同一份文件（Windows 部署时拷成 asr_bail
 from __future__ import annotations
 
 import base64
+import collections
 import concurrent.futures
 import io
 import os
@@ -75,11 +79,16 @@ def _is_native(model: str) -> bool:
     return model.startswith(("qwen-audio", "fun-asr"))
 
 
+def _is_message(model: str) -> bool:
+    return model.endswith("-message")
+
+
 class BailianASRClient:
     def __init__(self, api_key: str, url: str = "", model: str = "qwen-audio-3.0-asr-flash",
                  hotwords_yaml_path: str = "", timeout_sec: float = 15.0,
                  hedge_models=DEFAULT_HEDGE_MODELS, hedge_after_sec: float = 2.5,
                  timeout_ratio: float = 0.35, hedge_after_ratio: float = 0.1,
+                 workspace: str = "", context_turns: int = 3, context_max_chars: int = 300,
                  logger: Optional[Callable[[str], None]] = None):
         self.api_key = api_key
         self.model = model
@@ -101,6 +110,12 @@ class BailianASRClient:
         self.last_hedged = False      # 这次是否触发过对冲
         self._sessions: Dict[str, Any] = {}
         self._sess_lock = threading.Lock()
+        # *-message（WebSocket）用：工作空间可选（不配则走旧共享网关）；最近几句已输入的话作前文
+        self.workspace = workspace
+        self.context_max_chars = max(0, int(context_max_chars))
+        self._history: "collections.deque[str]" = collections.deque(maxlen=max(1, int(context_turns)))
+        self._history_on = int(context_turns) > 0
+        self._dash = None
         self._pool = concurrent.futures.ThreadPoolExecutor(max_workers=8, thread_name_prefix="asr")
 
     # ------------------------------------------------------------ 内部工具
@@ -155,10 +170,58 @@ class BailianASRClient:
             wf.writeframes(pcm.tobytes())
         return "data:audio/wav;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
 
+    def remember(self, text: str) -> None:
+        """记下一句已成功输入的话，作为 *-message 下一句识别的前文。"""
+        text = (text or "").strip()
+        if text and self._history_on:
+            self._history.append(text)
+
+    def _message_context(self) -> Optional[dict]:
+        if not self._history:
+            return None
+        joined = " / ".join(self._history)[-self.context_max_chars:]
+        return {"context": [
+            {"role": "user", "content": [{"type": "input_text", "text": "我前面说过：" + joined}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "好的。"}]},
+        ]}
+
+    def _call_message(self, model: str, pcm: bytes, timeout_sec: float) -> str:
+        """qwen-audio-3.1-asr-flash-message：WebSocket 会话，整段 PCM 按 100ms 一包发完再取结果。"""
+        import warnings
+        import dashscope  # 只有用 *-message 时才需要；普通版不依赖它
+        warnings.filterwarnings("ignore", message="no workspace configured")
+        with self._sess_lock:
+            if self._dash is None:
+                self._dash = dashscope.Client(api_key=self.api_key, region="cn-beijing", workspace=self.workspace or None)
+        params: Dict[str, Any] = {}
+        vocab = self._vocabulary()
+        if vocab:
+            params["vocabulary"] = vocab
+        ctx = self._message_context()
+        sents: Dict[Any, str] = {}
+        usage = None
+        with self._dash.audio.asr.recognize(model=model, format="pcm", sample_rate=16000, parameters=params,
+                                            input=ctx, timeout=timeout_sec) as rec:
+            for i in range(0, len(pcm), 3200):
+                rec.send_audio_frame(pcm[i:i + 3200])
+            rec.stop()
+            for ev in rec.events():
+                payload = ev.get("payload") or {}
+                sent = (payload.get("output") or {}).get("sentence") or {}
+                if sent.get("sentence_end"):
+                    sents[sent.get("sentence_id")] = sent.get("text", "")
+                usage = payload.get("usage") or usage
+        if usage:
+            self._log(f"ASR_USAGE model={model} in={usage.get('input_tokens')} out={usage.get('output_tokens')} "
+                      f"ctx_turns={len(self._history) if ctx else 0}")
+        return "".join(sents[k] for k in sorted(sents, key=lambda k: (k is None, k or 0))).strip()
+
     # ------------------------------------------------------------ 单模型调用
-    def _call_one(self, model: str, data_uri: str, context: str, timeout_sec: float = 0.0) -> str:
+    def _call_one(self, model: str, data_uri: str, context: str, timeout_sec: float = 0.0, pcm: bytes = b"") -> str:
         """返回识别文本（可为空串=无语音）；任何错误抛异常。"""
         timeout_sec = timeout_sec or self.timeout_sec
+        if _is_message(model):
+            return self._call_message(model, pcm, timeout_sec)
         if _is_native(model):
             payload = {
                 "model": model,
@@ -209,6 +272,7 @@ class BailianASRClient:
             return ""
         data_uri = self._encode(samples, sample_rate)
         models = [self.model] + self.hedge_models
+        pcm = (np.clip(samples, -1.0, 1.0) * 32767).astype(np.int16).tobytes() if any(map(_is_message, models)) else b""
         audio_sec = len(samples) / float(sample_rate)
         timeout_sec = max(self.timeout_sec, audio_sec * self.timeout_ratio)
         hedge_after_sec = max(self.hedge_after_sec, audio_sec * self.hedge_after_ratio)
@@ -224,7 +288,7 @@ class BailianASRClient:
             state["next"] += 1
             state["last_launch"] = time.time()
             state["pending"] += 1
-            f = self._pool.submit(self._call_one, m, data_uri, context, timeout_sec)
+            f = self._pool.submit(self._call_one, m, data_uri, context, timeout_sec, pcm)
             inflight[f] = m
             f.add_done_callback(done_q.put)
             if state["next"] > 1:

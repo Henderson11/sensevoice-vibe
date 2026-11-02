@@ -529,6 +529,8 @@ class SenseVoicePipeline:
                     compare_rec["inject_ok"] = int(ok_inject)
                     if ok_inject:
                         append_state_log(args.state_log, f"FINAL mode={mode} text={final_text}")
+                        if hasattr(self.model, "remember"):  # 百炼 *-message：作为下一句的前文
+                            self.model.remember(final_text)
                     else:
                         compare_rec["drop_reason"] = "inject_fail"
 
