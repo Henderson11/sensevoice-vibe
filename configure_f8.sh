@@ -76,10 +76,33 @@ PY
   done
 }
 
+# Shift+F8：最近语音面板（说了话没出字时查看、播放、重试）
+configure_gnome_recent_hotkey() {
+  command -v gsettings >/dev/null 2>&1 || return 0
+  local schema="org.gnome.settings-daemon.plugins.media-keys"
+  local path="/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/sensevoice-recent/"
+  local list
+  list="$(python3 - "$(gsettings get "$schema" custom-keybindings)" "$path" <<'PY'
+import ast, sys
+arr = ast.literal_eval(sys.argv[1].replace("@as ", ""))
+if sys.argv[2] not in arr:
+    arr.append(sys.argv[2])
+print(str(arr))
+PY
+)"
+  gsettings set "$schema" custom-keybindings "$list"
+  local kb_schema="org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:$path"
+  gsettings set "$kb_schema" name "SenseVoice Recent Voice"
+  gsettings set "$kb_schema" command "$ROOT_DIR/.venv/bin/python $ROOT_DIR/recent_voice.py"
+  gsettings set "$kb_schema" binding "<Shift>F8"
+}
+
 configure_gnome_hotkey
+configure_gnome_recent_hotkey
 
 echo "F8 configuration complete."
 echo "- GNOME global hotkey: F8 -> $TOGGLE_SCRIPT"
+echo "- GNOME global hotkey: Shift+F8 -> $ROOT_DIR/recent_voice.py (最近语音面板)"
 echo "- Config file: $LLM_ENV_FILE"
 echo "- All settings read from llm.env (single source of truth)"
 echo "State files: ${XDG_STATE_HOME:-$HOME/.local/state}/sensevoice-vibe"

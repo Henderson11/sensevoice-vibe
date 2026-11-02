@@ -503,4 +503,17 @@ def parse_args() -> argparse.Namespace:
         default=int(os.environ.get("SENSEVOICE_COMPARE_LOG_KEEP_LINES", "300")),
         help="Maximum number of compare JSONL lines to keep",
     )
+    # 最近语音备份：可能是本人说的、但没出字的段落盘到 <state_dir>/recent_audio/，可从通知或面板重试
+    p.add_argument("--recent-enable", type=int, choices=[0, 1],
+                   default=int(os.environ.get("SENSEVOICE_RECENT_ENABLE", "1")))
+    p.add_argument("--recent-max", type=int, default=int(os.environ.get("SENSEVOICE_RECENT_MAX", "50")))
+    p.add_argument("--recent-max-ok", type=int, default=int(os.environ.get("SENSEVOICE_RECENT_MAX_OK", "20")),
+                   help="Keep at most this many successfully injected segments")
+    p.add_argument("--recent-days", type=float, default=float(os.environ.get("SENSEVOICE_RECENT_DAYS", "3")))
+    p.add_argument("--recent-spk-min-score", type=float,
+                   default=float(os.environ.get("SENSEVOICE_RECENT_SPK_MIN_SCORE", "0.40")),
+                   help="Speaker-rejected segments scoring at least this are kept (lower = almost always others)")
+    p.add_argument("--recent-notify-min-ms", type=int,
+                   default=int(os.environ.get("SENSEVOICE_RECENT_NOTIFY_MIN_MS", "5000")),
+                   help="Speaker-rejected kept segments at least this long pop a notification with a retry button")
     return p.parse_args()

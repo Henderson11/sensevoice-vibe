@@ -30,6 +30,7 @@ from sensevoice.lexicon.project import ProjectLexicon
 from sensevoice.vad.stream import make_arecord_process
 from sensevoice.logging import append_state_log, append_jsonl_bounded
 from sensevoice.control_socket import ControlServer
+from sensevoice.recent import RecentStore
 
 
 class SenseVoicePipeline:
@@ -73,6 +74,12 @@ class SenseVoicePipeline:
         self.pre_roll_frames = max(0, int(args.pre_roll_ms / args.frame_ms))
         self.proc: Optional[subprocess.Popen] = None
         self._frame_q: Optional["queue.Queue[Optional[bytes]]"] = None
+        # 最近语音备份 + 重试队列（通知按钮 / 控制 socket 的 RETRY 都排进这里，由主循环处理）
+        self._retry_q: "queue.Queue[str]" = queue.Queue()
+        self.recent: Optional[RecentStore] = None
+        if args.recent_enable:
+            self.recent = RecentStore(os.path.join(self.state_dir, "recent_audio"), max_total=args.recent_max,
+                                      max_ok=args.recent_max_ok, max_days=args.recent_days)
         self.pre_roll: Deque[bytes] = collections.deque(maxlen=self.pre_roll_frames)
         self.in_speech = False
         self.segment_id = 0
@@ -374,8 +381,8 @@ class SenseVoicePipeline:
             signal.signal(signal.SIGHUP, _deactivate)
         append_state_log(self.args.state_log, f"SIGNAL_TRAPS_INSTALLED faulthandler={fault_log_path}")
 
-    def _process_finalized_segment(self, samples: np.ndarray, seg_ms: float):
-        """处理已结束的语音段：声纹 → ASR → LLM → 注入"""
+    def _process_finalized_segment(self, samples: np.ndarray, seg_ms: float, retry_entry: Optional[Dict] = None):
+        """处理已结束的语音段：声纹 → ASR → LLM → 注入。retry_entry 非空 = 用户手动重试一条最近语音，跳过声纹。"""
         assert self.speaker_gate is not None
         assert self.post_llm is not None
         assert self.project_lexicon is not None
@@ -398,7 +405,13 @@ class SenseVoicePipeline:
         spk_thr_for_conf: Optional[float] = None
 
         # 1. 先声纹验证——不通过则跳过 ASR，节省推理开销
-        spk_ok, spk_score, spk_reason, spk_thr = self.speaker_gate.verify(samples, args.sample_rate, seg_ms)
+        if retry_entry is not None:
+            spk_ok, spk_reason = True, "retry"
+            spk_score = float(retry_entry.get("spk_score") or 0.0)
+            spk_thr = float(self.speaker_gate.threshold)
+            compare_rec["retry_of"] = retry_entry.get("id", "")
+        else:
+            spk_ok, spk_score, spk_reason, spk_thr = self.speaker_gate.verify(samples, args.sample_rate, seg_ms)
         compare_rec["spk_pass"] = int(spk_ok)
         compare_rec["spk_score"] = round(float(spk_score), 4)
         compare_rec["spk_thr"] = round(float(spk_thr), 4)
@@ -408,10 +421,12 @@ class SenseVoicePipeline:
             compare_rec["drop_reason"] = f"spk:{spk_reason}"
             if bool(args.compare_log):
                 append_jsonl_bounded(args.compare_log_file, compare_rec, keep_lines=args.compare_log_keep_lines)
+            if spk_score >= args.recent_spk_min_score:  # 接近阈值：可能是本人（混了旁人声音），留底
+                self._recent_record(samples, seg_ms, "spk_reject", spk_score, "", None)
             return
 
-        # 声纹通过
-        if self.speaker_gate.requested and self.speaker_gate.enabled:
+        # 声纹通过（手动重试不喂给自适应阈值/自动注册）
+        if self.speaker_gate.requested and self.speaker_gate.enabled and retry_entry is None:
             append_state_log(args.state_log, f"SPK_PASS score={spk_score:.3f} thr={spk_thr:.3f} reason={spk_reason}")
             spk_score_for_conf = float(spk_score)
             spk_thr_for_conf = float(spk_thr)
@@ -428,7 +443,8 @@ class SenseVoicePipeline:
         raw_final_text, native_conf_score, conf_source, native_token_scores = transcribe_array_with_conf(
             self.model, samples, args.language, context=asr_context
         )
-        if getattr(self.model, "last_failed", False):
+        asr_failed = bool(getattr(self.model, "last_failed", False))
+        if asr_failed:
             self._notify_asr_failed(seg_ms)
         final_text = sanitize_transcript_text(raw_final_text, args.language, bool(args.filter_fillers))
         compare_rec["raw_asr"] = raw_final_text
@@ -519,6 +535,97 @@ class SenseVoicePipeline:
         if bool(args.compare_log):
             append_jsonl_bounded(args.compare_log_file, compare_rec, keep_lines=args.compare_log_keep_lines)
 
+        if compare_rec["inject_ok"]:
+            outcome = "ok"
+        elif compare_rec["final_injected"]:
+            outcome = "inject_failed"
+        elif asr_failed:
+            outcome = "asr_failed"
+        else:
+            outcome = "asr_empty"
+        self._recent_record(samples, seg_ms, outcome, spk_score,
+                            compare_rec["final_injected"] or compare_rec["raw_asr"], retry_entry)
+
+    def _recent_record(self, samples: np.ndarray, seg_ms: float, status: str, spk_score: float,
+                       text: str, retry_entry: Optional[Dict]) -> None:
+        """把一段语音及其结果记进最近语音备份；没出字的弹带按钮的通知。重试则更新原记录。"""
+        if self.recent is None:
+            return
+        args = self.args
+        try:
+            if retry_entry is not None:
+                eid = retry_entry["id"]
+                self.recent.update(eid, status="retry_" + status, text=text or retry_entry.get("text", ""))
+            else:
+                eid = self.recent.save(samples, args.sample_rate, self.segment_id, seg_ms, status, spk_score, text)
+            append_state_log(args.state_log, f"RECENT_SAVE id={eid} status={status} seg_ms={int(seg_ms)}"
+                                             f"{' retry=1' if retry_entry is not None else ''}")
+        except Exception as e:
+            append_state_log(args.state_log, f"RECENT_SAVE_ERROR {type(e).__name__}: {e}", level="WARN")
+            return
+        when = time.strftime("%H:%M:%S")
+        sec = seg_ms / 1000.0
+        retry_btn = [("retry", "重新识别并输入"), ("ignore", "忽略")]
+        if retry_entry is not None:
+            if status != "ok":
+                self._notify_actions(eid, f"重试后仍没有出字（{status}），录音还在，可按 Shift+F8 查看", [])
+        elif status == "spk_reject" and seg_ms >= args.recent_notify_min_ms:
+            self._notify_actions(eid, f"{when} 结束的一段 {sec:.0f} 秒语音没通过声纹（{spk_score:.2f}），未输入", retry_btn)
+        elif status == "asr_failed":
+            self._notify_actions(eid, f"{when} 结束的一段 {sec:.0f} 秒语音识别失败/超时，未输入", retry_btn)
+        elif status == "inject_failed":
+            self._notify_actions(eid, f"已识别但没能输入到光标处：{compact_log_text(text)[:40]}",
+                                 [("copy", "复制文字"), ("ignore", "忽略")], text=text)
+
+    def _notify_actions(self, eid: str, body: str, actions, text: str = "") -> None:
+        """弹桌面通知；带按钮时 notify-send -A 会阻塞到用户点击/关闭，所以放后台线程等结果。
+        点"重新识别并输入"→ 排进重试队列由主循环处理；点"复制文字"→ wl-copy。"""
+        args = self.args
+
+        def run():
+            cmd = ["notify-send", "-a", "SenseVoice"]
+            for name, label in actions:
+                cmd += ["-A", f"{name}={label}"]
+            cmd += ["SenseVoice 没有出字", body]
+            try:
+                p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+                try:
+                    out, _ = p.communicate(timeout=1800)
+                except subprocess.TimeoutExpired:
+                    p.kill()
+                    return
+            except Exception:
+                return
+            action = (out or "").strip()
+            if action:
+                append_state_log(args.state_log, f"NOTIFY_ACTION id={eid} action={action}")
+            if action == "retry":
+                self._retry_q.put(eid)
+            elif action == "copy" and text:
+                try:
+                    subprocess.run(["wl-copy", text], timeout=5)
+                except Exception:
+                    pass
+
+        threading.Thread(target=run, daemon=True, name="notify-recent").start()
+
+    def _run_retry(self, eid: str) -> None:
+        args = self.args
+        entry = self.recent.get(eid) if self.recent is not None else None
+        if entry is None:
+            append_state_log(args.state_log, f"RETRY_MISSING id={eid}")
+            self._notify_actions(eid, "这条录音已过期或不存在，无法重试", [])
+            return
+        append_state_log(args.state_log, f"RETRY_START id={eid} seg_ms={entry['seg_ms']} status={entry['status']}")
+        time.sleep(0.4)  # 点通知按钮/关面板后，等焦点回到原来的输入窗口再注入
+        try:
+            samples = self.recent.load_samples(entry)
+            self._process_finalized_segment(samples, float(entry["seg_ms"]), retry_entry=entry)
+        except Exception as e:
+            append_state_log(args.state_log, f"RETRY_ERROR id={eid} {type(e).__name__}: {e}", level="WARN")
+            return
+        append_state_log(args.state_log, f"RETRY_DONE id={eid}")
+
     def run(self) -> int:
         """运行主循环"""
         args = self.args
@@ -572,6 +679,9 @@ class SenseVoicePipeline:
                     self.active = not self.active
                     append_state_log(args.state_log, f"CONTROL_TOGGLE active={int(self.active)}")
                     self.write_status(active=self.active, ready=self.model_ready)
+
+                while not self._retry_q.empty():  # 关着收音也能重试
+                    self._run_retry(self._retry_q.get_nowait())
 
                 if self.active and self.proc is None:
                     try:
@@ -725,6 +835,8 @@ class SenseVoicePipeline:
         """ASR 所有模型都失败/超时：这句话没能输入。日志里 ASR_FAILED 已记录原因，这里再弹桌面通知，
         避免用户以为"说了没反应"却不知道是识别服务挂了（之前超时是静默丢弃）。"""
         append_state_log(self.args.state_log, f"ASR_DROPPED seg_ms={int(seg_ms)} 这句话未输入(全部ASR模型失败/超时)")
+        if self.recent is not None:
+            return  # 由 _recent_record 弹带"重新识别"按钮的通知
         try:
             import subprocess
             subprocess.Popen(["notify-send", "-t", "4000", "SenseVoice", "识别失败/超时，这句话没有输入"],
@@ -770,6 +882,12 @@ class SenseVoicePipeline:
         # 命令刚排进队列的这一刻它还是旧值。之前直接返回 self.active 导致
         # toggle_resident_f8.sh 的 ON/OFF 提示永远落后一步、看起来像是反的
         # (按下去要开，提示却说关；再按一次要关，提示又说开)。
+        if cmd.startswith("RETRY "):
+            eid = cmd.split(None, 1)[1].strip()
+            if self.recent is None or self.recent.get(eid) is None:
+                return {"ok": False, "err": "not_found"}
+            self._retry_q.put(eid)
+            return {"ok": True}
         if cmd == "ACTIVATE":
             self.force_active = True
             predicted_active = True

@@ -1,6 +1,6 @@
 """Daemon 控制 socket — 替代 SIGHUP/USR2 + status 文件的简陋 IPC。
 
-用 unix domain socket 提供同步 RPC：ACTIVATE/DEACTIVATE/TOGGLE/STATUS。
+用 unix domain socket 提供同步 RPC：ACTIVATE/DEACTIVATE/TOGGLE/STATUS/RETRY <id>。
 listener 在主循环启动前就 bind，所以模型加载期间命令也能被接收并入队，
 模型 ready 后主循环立即消费——彻底消除 "import 阶段信号被默认 handler
 吞掉" 这种竞态。
@@ -104,4 +104,7 @@ class ControlServer:
             r = self._submit(cmd)
             tail = "\tqueued=1" if r.get("queued") else ""
             return f"OK\tactive={r['active']}\tready={r['ready']}{tail}"
+        if cmd.startswith("RETRY "):  # 重试一条最近语音（跳过声纹），id 见 recent_audio/index.jsonl
+            r = self._submit(cmd)
+            return "OK\tqueued=1" if r.get("ok") else f"ERR\t{r.get('err', 'retry_failed')}"
         return f"ERR\tunknown_cmd:{cmd[:32]}"
