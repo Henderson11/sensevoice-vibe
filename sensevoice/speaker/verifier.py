@@ -82,56 +82,58 @@ class SpeakerVerifierGate:
         if not enabled:
             return
 
+        # 用户已明确 enabled=True，任何加载失败都必须 fatal raise——否则 daemon
+        # 看似 ready 实则跳过声纹检查，旁人语音会直接通过到 ASR（静默安全降级）。
+        # systemd Restart=always 5 次熔断后会把问题摆到台面上。
         enroll_paths = self._resolve_enroll_paths(enroll_wav or "")
         if not enroll_paths:
-            self.reason = f"enroll_missing:{(enroll_wav or '').strip() or '-'}"
-            return
-
-        try:
-            import torch  # type: ignore
-            import torch.nn.functional as F  # type: ignore
-
-            self._torch = torch
-            self._F = F
-
-            from funasr import AutoModel as FunASRModel  # type: ignore
-            self._funasr_model = FunASRModel(
-                model=model_id,
-                disable_update=True,
-                disable_log=True,
-                trust_remote_code=False,
+            raise RuntimeError(
+                f"speaker_verify enabled but no enroll wav found at "
+                f"{(enroll_wav or '').strip() or '<empty>'} —— 检查路径展开"
+                f"（systemd EnvironmentFile 不展开 $HOME）或运行注册脚本"
             )
 
-            emb_list = []
-            for enroll_path in enroll_paths:
-                enroll_samples, sr = self._load_wav_mono_float32(enroll_path)
-                if sr != 16000:
-                    enroll_samples = self._resample_linear(enroll_samples, sr, 16000)
-                if enroll_samples.size < 16000:
-                    continue
-                emb = self._extract_embedding(enroll_samples, torch)
-                emb_list.append(emb)
-                self._enroll_paths.append(enroll_path)
+        import torch  # type: ignore
+        import torch.nn.functional as F  # type: ignore
 
-            if not emb_list:
-                self.reason = "enroll_invalid:no_valid_wav"
-                return
+        self._torch = torch
+        self._F = F
 
-            self._enroll_embeddings = torch.cat(emb_list, dim=0)
-            self.enroll_count = int(self._enroll_embeddings.shape[0])
-            self._configure_auto_enroll(enroll_wav, auto_enroll_dir)
-            self._apply_in_memory_prune()
+        from funasr import AutoModel as FunASRModel  # type: ignore
+        self._funasr_model = FunASRModel(
+            model=model_id,
+            disable_update=True,
+            disable_log=True,
+            trust_remote_code=False,
+        )
 
-            self.enabled = True
-            self.reason = (
-                f"ready:n={self.enroll_count},agg={self.score_agg},k={self.score_topk},"
-                f"adapt={int(self.adaptive_enable)},pruned={self.pruned_count}"
+        emb_list = []
+        for enroll_path in enroll_paths:
+            enroll_samples, sr = self._load_wav_mono_float32(enroll_path)
+            if sr != 16000:
+                enroll_samples = self._resample_linear(enroll_samples, sr, 16000)
+            if enroll_samples.size < 16000:
+                continue
+            emb = self._extract_embedding(enroll_samples, torch)
+            emb_list.append(emb)
+            self._enroll_paths.append(enroll_path)
+
+        if not emb_list:
+            raise RuntimeError(
+                f"speaker_verify enabled but all {len(enroll_paths)} enroll wav(s) "
+                f"too short (<1s) or unreadable: {enroll_paths}"
             )
-        except Exception as e:
-            import sys
-            print(f"[sensevoice] warning: speaker verifier init failed: {type(e).__name__}: {e}", file=sys.stderr)
-            self.reason = f"init_error:{type(e).__name__}"
-            self.enabled = False
+
+        self._enroll_embeddings = torch.cat(emb_list, dim=0)
+        self.enroll_count = int(self._enroll_embeddings.shape[0])
+        self._configure_auto_enroll(enroll_wav, auto_enroll_dir)
+        self._apply_in_memory_prune()
+
+        self.enabled = True
+        self.reason = (
+            f"ready:n={self.enroll_count},agg={self.score_agg},k={self.score_topk},"
+            f"adapt={int(self.adaptive_enable)},pruned={self.pruned_count}"
+        )
 
     @staticmethod
     def _resolve_enroll_paths(spec: str) -> List[str]:

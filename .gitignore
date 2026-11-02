@@ -15,6 +15,8 @@ models/
 
 # 配置（含密钥，用模板替代）
 llm.env
+# 私人热词表含项目内部术语，只留本机，不进公开仓库
+config/hotwords.yaml
 
 # 生成文件（从 .xml.in 模板生成）
 ibus-sensevoice/sensevoice-voice.xml

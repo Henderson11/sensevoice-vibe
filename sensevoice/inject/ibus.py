@@ -92,24 +92,46 @@ class IBusInjector:
         return ok
 
     def _try_socket_send(self, line: str) -> bool:
+        # 重试只允许覆盖 connect 阶段失败。sendall 之后任何错误（含 ack 超时）
+        # 都不能重试 —— 引擎可能已经收到消息，重发会造成重复注入。
         for _ in range(2):
             try:
-                with self._socket_mod.socket(
+                s = self._socket_mod.socket(
                     self._socket_mod.AF_UNIX, self._socket_mod.SOCK_STREAM
-                ) as s:
-                    s.settimeout(self.ack_timeout_sec)
-                    s.connect(self._sock_path)
-                    s.sendall(line.encode("utf-8"))
-                    ack = s.recv(256).decode("utf-8", errors="replace").strip()
-                    if ack.startswith("OK\t"):
-                        self.last_error = ""
-                        return True
-                    if ack.startswith("ERR\t"):
-                        self.last_error = ack[4:] or "inject_error"
-                    else:
-                        self.last_error = f"bad_ack:{ack[:80]}"
+                )
             except Exception as e:
                 self.last_error = f"{type(e).__name__}:{e}"
+                continue
+            try:
+                s.settimeout(self.ack_timeout_sec)
+                try:
+                    s.connect(self._sock_path)
+                except Exception as e:
+                    self.last_error = f"{type(e).__name__}:{e}"
+                    continue
+                try:
+                    s.sendall(line.encode("utf-8"))
+                except Exception as e:
+                    self.last_error = f"sendall:{type(e).__name__}:{e}"
+                    return False
+                try:
+                    ack = s.recv(256).decode("utf-8", errors="replace").strip()
+                except Exception as e:
+                    self.last_error = f"ack_timeout:{type(e).__name__}:{e}"
+                    return False
+                if ack.startswith("OK\t"):
+                    self.last_error = ""
+                    return True
+                if ack.startswith("ERR\t"):
+                    self.last_error = ack[4:] or "inject_error"
+                else:
+                    self.last_error = f"bad_ack:{ack[:80]}"
+                return False
+            finally:
+                try:
+                    s.close()
+                except Exception:
+                    pass
         return False
 
     def close(self) -> None:

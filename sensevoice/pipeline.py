@@ -2,8 +2,10 @@
 import collections
 import json
 import os
+import queue
 import signal
 import subprocess
+import threading
 import time
 from typing import Deque, Dict, List, Optional, Tuple
 
@@ -18,6 +20,7 @@ from sensevoice.asr.confidence import _select_focus_low_tokens
 from sensevoice.config.settings import SenseVoiceConfig
 from sensevoice.asr.router import ConfidenceRouter
 from sensevoice.asr.model import load_model, transcribe_array, transcribe_array_with_conf
+from sensevoice.lexicon.hotwords import build_context as build_asr_context
 from sensevoice.inject.ibus import IBusInjector
 from sensevoice.inject.clipboard import FocusInjector
 from sensevoice.ui.indicator import SpeechIndicator
@@ -26,6 +29,8 @@ from sensevoice.speaker.verifier import SpeakerVerifierGate
 from sensevoice.lexicon.project import ProjectLexicon
 from sensevoice.vad.stream import make_arecord_process
 from sensevoice.logging import append_state_log, append_jsonl_bounded
+from sensevoice.control_socket import ControlServer
+from sensevoice.recent import RecentStore
 
 
 class SenseVoicePipeline:
@@ -56,14 +61,25 @@ class SenseVoicePipeline:
         self.conf_router: Optional[ConfidenceRouter] = None
         self.vad = None  # type: ignore[assignment]  # webrtcvad.Vad
         self.inject_mode_name: str = ""
+        self.control_server: Optional[ControlServer] = None
 
         # --- VAD 状态 ---
         self.frame_samples = int(args.sample_rate * args.frame_ms / 1000)
         self.frame_bytes = self.frame_samples * 2
         self.start_frames = max(1, int(args.start_ms / args.frame_ms))
         self.end_frames = max(1, int(args.endpoint_silence_ms / args.frame_ms))
+        # 软切：段长进入 [上限-窗口, 上限) 后改用短停顿阈值收尾；窗口最多占上限的一半
+        self.soft_cut_frames = min(self.end_frames, max(1, int(args.soft_cut_silence_ms / args.frame_ms)))
+        self.soft_cut_start_ms = max(args.max_segment_ms // 2, args.max_segment_ms - args.soft_cut_window_ms)
         self.pre_roll_frames = max(0, int(args.pre_roll_ms / args.frame_ms))
         self.proc: Optional[subprocess.Popen] = None
+        self._frame_q: Optional["queue.Queue[Optional[bytes]]"] = None
+        # 最近语音备份 + 重试队列（通知按钮 / 控制 socket 的 RETRY 都排进这里，由主循环处理）
+        self._retry_q: "queue.Queue[str]" = queue.Queue()
+        self.recent: Optional[RecentStore] = None
+        if args.recent_enable:
+            self.recent = RecentStore(os.path.join(self.state_dir, "recent_audio"), max_total=args.recent_max,
+                                      max_ok=args.recent_max_ok, max_days=args.recent_days)
         self.pre_roll: Deque[bytes] = collections.deque(maxlen=self.pre_roll_frames)
         self.in_speech = False
         self.segment_id = 0
@@ -221,30 +237,123 @@ class SenseVoicePipeline:
         self.proc = make_arecord_process(self.args)
         if self.proc.stdout is None:
             raise RuntimeError("arecord stdout unavailable")
+        self._frame_q = queue.Queue(maxsize=50 * 600)  # 20ms 帧，最多积压 10 分钟
+        threading.Thread(target=self._drain_capture, args=(self.proc.stdout, self._frame_q),
+                         daemon=True, name="arecord-reader").start()
         self.indicator.reset_session()
         self.inject("CTRL", "RESET")
         self.reset_capture_state()
         append_state_log(self.args.state_log, "STREAM_START")
 
+    def _drain_capture(self, stdout, frame_q: "queue.Queue[Optional[bytes]]") -> None:
+        """独立线程持续抽干 arecord 管道，切成整帧入队；EOF 时放入 None。
+        主循环同步处理一段（声纹+ASR+润色，3 分钟的段可达 20~30s）期间不读管道，而管道+ALSA
+        只能缓冲约 2.6s，超出部分 arecord 静默丢弃（2026-11-02 实测停读 25s 丢 22s 音频）。"""
+        pending = bytearray()
+        while True:
+            try:
+                data = stdout.read(4096)
+            except (OSError, ValueError):
+                break
+            if not data:
+                break
+            pending.extend(data)
+            while len(pending) >= self.frame_bytes:
+                frame_q.put(bytes(pending[:self.frame_bytes]))
+                del pending[:self.frame_bytes]
+        frame_q.put(None)
+
     def stop_capture(self, reason: str):
-        if self.proc is None:
-            return
         if self.in_speech and self.indicator:
             self.indicator.on_speech_end()
             append_state_log(self.args.state_log, "SPEECH_END")
+
+        # 已知子进程：SIGTERM → 2s 等待 → SIGKILL → 短等待
+        proc = self.proc
+        if proc is not None:
+            try:
+                proc.terminate()
+            except Exception as e:
+                append_state_log(self.args.state_log, f"STREAM_STOP_TERM_ERR {type(e).__name__}: {e}")
+            try:
+                proc.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                append_state_log(self.args.state_log, f"STREAM_STOP_KILL pid={proc.pid} reason={reason}")
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                try:
+                    proc.wait(timeout=1.0)
+                except Exception:
+                    pass
+            except Exception as e:
+                append_state_log(self.args.state_log, f"STREAM_STOP_WAIT_ERR {type(e).__name__}: {e}")
+            self.proc = None
+        self._frame_q = None
+
+        # 兜底：扫所有挂在本 daemon 下的孤儿 arecord（self.proc 与 OS 状态可能漂移）
         try:
-            self.proc.terminate()
-        except Exception:
-            pass
-        try:
-            self.proc.wait(timeout=0.5)
-        except Exception:
-            pass
-        self.proc = None
+            my_pid = os.getpid()
+            ps_out = subprocess.run(
+                ["ps", "--ppid", str(my_pid), "-o", "pid=,comm="],
+                capture_output=True, text=True, timeout=2.0,
+            )
+            for line in ps_out.stdout.splitlines():
+                parts = line.split(None, 1)
+                if len(parts) < 2:
+                    continue
+                pid_str, comm = parts[0], parts[1].strip()
+                if comm != "arecord":
+                    continue
+                try:
+                    cpid = int(pid_str)
+                except ValueError:
+                    continue
+                append_state_log(self.args.state_log, f"STREAM_STOP_REAP_ORPHAN pid={cpid}")
+                try:
+                    os.kill(cpid, signal.SIGTERM)
+                except ProcessLookupError:
+                    continue
+                except Exception:
+                    pass
+                # 短等再 SIGKILL
+                for _ in range(20):
+                    try:
+                        os.kill(cpid, 0)
+                    except ProcessLookupError:
+                        break
+                    time.sleep(0.05)
+                else:
+                    try:
+                        os.kill(cpid, signal.SIGKILL)
+                    except Exception:
+                        pass
+                # reap 僵尸
+                try:
+                    os.waitpid(cpid, os.WNOHANG)
+                except ChildProcessError:
+                    pass
+        except Exception as e:
+            append_state_log(self.args.state_log, f"STREAM_STOP_REAP_ERR {type(e).__name__}: {e}")
+
         self.reset_capture_state()
         append_state_log(self.args.state_log, f"STREAM_STOP reason={reason}")
 
     def _setup_signals(self):
+        # faulthandler：捕获 SIGSEGV/SIGABRT/SIGFPE/SIGBUS 等致命错误的 traceback
+        # 写到独立文件，避免与 stdout 抢 buffer
+        import faulthandler
+        fault_log_path = self.args.state_log.replace(".log", ".fault.log")
+        if not fault_log_path.endswith(".fault.log"):
+            fault_log_path = self.args.state_log + ".fault.log"
+        self._fault_fh = open(fault_log_path, "a", buffering=1)
+        faulthandler.enable(file=self._fault_fh, all_threads=True)
+
+        # SIGPIPE 屏蔽：防止 LLM HTTP 连接 reset 时被 SIGPIPE 默认行为杀进程
+        if hasattr(signal, "SIGPIPE"):
+            signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+
         def _stop(_sig, _frame):  # noqa: ARG001
             sig_name = signal.Signals(_sig).name if hasattr(signal, 'Signals') else str(_sig)
             append_state_log(
@@ -270,9 +379,10 @@ class SenseVoicePipeline:
             signal.signal(signal.SIGUSR2, _activate)
         if hasattr(signal, "SIGHUP"):
             signal.signal(signal.SIGHUP, _deactivate)
+        append_state_log(self.args.state_log, f"SIGNAL_TRAPS_INSTALLED faulthandler={fault_log_path}")
 
-    def _process_finalized_segment(self, samples: np.ndarray, seg_ms: float):
-        """处理已结束的语音段：声纹 → ASR → LLM → 注入"""
+    def _process_finalized_segment(self, samples: np.ndarray, seg_ms: float, retry_entry: Optional[Dict] = None):
+        """处理已结束的语音段：声纹 → ASR → LLM → 注入。retry_entry 非空 = 用户手动重试一条最近语音，跳过声纹。"""
         assert self.speaker_gate is not None
         assert self.post_llm is not None
         assert self.project_lexicon is not None
@@ -295,7 +405,13 @@ class SenseVoicePipeline:
         spk_thr_for_conf: Optional[float] = None
 
         # 1. 先声纹验证——不通过则跳过 ASR，节省推理开销
-        spk_ok, spk_score, spk_reason, spk_thr = self.speaker_gate.verify(samples, args.sample_rate, seg_ms)
+        if retry_entry is not None:
+            spk_ok, spk_reason = True, "retry"
+            spk_score = float(retry_entry.get("spk_score") or 0.0)
+            spk_thr = float(self.speaker_gate.threshold)
+            compare_rec["retry_of"] = retry_entry.get("id", "")
+        else:
+            spk_ok, spk_score, spk_reason, spk_thr = self.speaker_gate.verify(samples, args.sample_rate, seg_ms)
         compare_rec["spk_pass"] = int(spk_ok)
         compare_rec["spk_score"] = round(float(spk_score), 4)
         compare_rec["spk_thr"] = round(float(spk_thr), 4)
@@ -305,10 +421,12 @@ class SenseVoicePipeline:
             compare_rec["drop_reason"] = f"spk:{spk_reason}"
             if bool(args.compare_log):
                 append_jsonl_bounded(args.compare_log_file, compare_rec, keep_lines=args.compare_log_keep_lines)
+            if spk_score >= args.recent_spk_min_score:  # 接近阈值：可能是本人（混了旁人声音），留底
+                self._recent_record(samples, seg_ms, "spk_reject", spk_score, "", None)
             return
 
-        # 声纹通过
-        if self.speaker_gate.requested and self.speaker_gate.enabled:
+        # 声纹通过（手动重试不喂给自适应阈值/自动注册）
+        if self.speaker_gate.requested and self.speaker_gate.enabled and retry_entry is None:
             append_state_log(args.state_log, f"SPK_PASS score={spk_score:.3f} thr={spk_thr:.3f} reason={spk_reason}")
             spk_score_for_conf = float(spk_score)
             spk_thr_for_conf = float(spk_thr)
@@ -320,9 +438,14 @@ class SenseVoicePipeline:
                 append_state_log(args.state_log, f"SPK_AUTO_ENROLL_SKIP reason={add_info} score={spk_score:.3f} n={self.speaker_gate.enroll_count}")
 
         # 2. ASR 识别（只有声纹通过才执行）
+        #    qwen3asr-gpu 后端额外注入 4 组热词 context 做 biasing(其他后端忽略 context)
+        asr_context = self._build_asr_context()
         raw_final_text, native_conf_score, conf_source, native_token_scores = transcribe_array_with_conf(
-            self.model, samples, args.language
+            self.model, samples, args.language, context=asr_context
         )
+        asr_failed = bool(getattr(self.model, "last_failed", False))
+        if asr_failed:
+            self._notify_asr_failed(seg_ms)
         final_text = sanitize_transcript_text(raw_final_text, args.language, bool(args.filter_fillers))
         compare_rec["raw_asr"] = raw_final_text
         compare_rec["after_sanitize"] = final_text
@@ -406,11 +529,104 @@ class SenseVoicePipeline:
                     compare_rec["inject_ok"] = int(ok_inject)
                     if ok_inject:
                         append_state_log(args.state_log, f"FINAL mode={mode} text={final_text}")
+                        if hasattr(self.model, "remember"):  # 百炼 *-message：作为下一句的前文
+                            self.model.remember(final_text)
                     else:
                         compare_rec["drop_reason"] = "inject_fail"
 
         if bool(args.compare_log):
             append_jsonl_bounded(args.compare_log_file, compare_rec, keep_lines=args.compare_log_keep_lines)
+
+        if compare_rec["inject_ok"]:
+            outcome = "ok"
+        elif compare_rec["final_injected"]:
+            outcome = "inject_failed"
+        elif asr_failed:
+            outcome = "asr_failed"
+        else:
+            outcome = "asr_empty"
+        self._recent_record(samples, seg_ms, outcome, spk_score,
+                            compare_rec["final_injected"] or compare_rec["raw_asr"], retry_entry)
+
+    def _recent_record(self, samples: np.ndarray, seg_ms: float, status: str, spk_score: float,
+                       text: str, retry_entry: Optional[Dict]) -> None:
+        """把一段语音及其结果记进最近语音备份；没出字的弹带按钮的通知。重试则更新原记录。"""
+        if self.recent is None:
+            return
+        args = self.args
+        try:
+            if retry_entry is not None:
+                eid = retry_entry["id"]
+                self.recent.update(eid, status="retry_" + status, text=text or retry_entry.get("text", ""))
+            else:
+                eid = self.recent.save(samples, args.sample_rate, self.segment_id, seg_ms, status, spk_score, text)
+            append_state_log(args.state_log, f"RECENT_SAVE id={eid} status={status} seg_ms={int(seg_ms)}"
+                                             f"{' retry=1' if retry_entry is not None else ''}")
+        except Exception as e:
+            append_state_log(args.state_log, f"RECENT_SAVE_ERROR {type(e).__name__}: {e}", level="WARN")
+            return
+        when = time.strftime("%H:%M:%S")
+        sec = seg_ms / 1000.0
+        retry_btn = [("retry", "重新识别并输入"), ("ignore", "忽略")]
+        if retry_entry is not None:
+            if status != "ok":
+                self._notify_actions(eid, f"重试后仍没有出字（{status}），录音还在，可按 Shift+F8 查看", [])
+        elif status == "spk_reject" and seg_ms >= args.recent_notify_min_ms:
+            self._notify_actions(eid, f"{when} 结束的一段 {sec:.0f} 秒语音没通过声纹（{spk_score:.2f}），未输入", retry_btn)
+        elif status == "asr_failed":
+            self._notify_actions(eid, f"{when} 结束的一段 {sec:.0f} 秒语音识别失败/超时，未输入", retry_btn)
+        elif status == "inject_failed":
+            self._notify_actions(eid, f"已识别但没能输入到光标处：{compact_log_text(text)[:40]}",
+                                 [("copy", "复制文字"), ("ignore", "忽略")], text=text)
+
+    def _notify_actions(self, eid: str, body: str, actions, text: str = "") -> None:
+        """弹桌面通知；带按钮时 notify-send -A 会阻塞到用户点击/关闭，所以放后台线程等结果。
+        点"重新识别并输入"→ 排进重试队列由主循环处理；点"复制文字"→ wl-copy。"""
+        args = self.args
+
+        def run():
+            cmd = ["notify-send", "-a", "SenseVoice"]
+            for name, label in actions:
+                cmd += ["-A", f"{name}={label}"]
+            cmd += ["SenseVoice 没有出字", body]
+            try:
+                p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+                try:
+                    out, _ = p.communicate(timeout=1800)
+                except subprocess.TimeoutExpired:
+                    p.kill()
+                    return
+            except Exception:
+                return
+            action = (out or "").strip()
+            if action:
+                append_state_log(args.state_log, f"NOTIFY_ACTION id={eid} action={action}")
+            if action == "retry":
+                self._retry_q.put(eid)
+            elif action == "copy" and text:
+                try:
+                    subprocess.run(["wl-copy", text], timeout=5)
+                except Exception:
+                    pass
+
+        threading.Thread(target=run, daemon=True, name="notify-recent").start()
+
+    def _run_retry(self, eid: str) -> None:
+        args = self.args
+        entry = self.recent.get(eid) if self.recent is not None else None
+        if entry is None:
+            append_state_log(args.state_log, f"RETRY_MISSING id={eid}")
+            self._notify_actions(eid, "这条录音已过期或不存在，无法重试", [])
+            return
+        append_state_log(args.state_log, f"RETRY_START id={eid} seg_ms={entry['seg_ms']} status={entry['status']}")
+        time.sleep(0.4)  # 点通知按钮/关面板后，等焦点回到原来的输入窗口再注入
+        try:
+            samples = self.recent.load_samples(entry)
+            self._process_finalized_segment(samples, float(entry["seg_ms"]), retry_entry=entry)
+        except Exception as e:
+            append_state_log(args.state_log, f"RETRY_ERROR id={eid} {type(e).__name__}: {e}", level="WARN")
+            return
+        append_state_log(args.state_log, f"RETRY_DONE id={eid}")
 
     def run(self) -> int:
         """运行主循环"""
@@ -431,7 +647,19 @@ class SenseVoicePipeline:
         self.write_status(active=self.active, ready=False)
         self._setup_signals()
 
+        # 控制 socket 在模型加载前就 listen ——
+        # toggle 脚本的命令在加载期间也能进队列，主循环 ready 后立即消费。
+        # 替代 SIGHUP/USR2 + status 文件这套脏 IPC。
+        self.control_server = ControlServer(
+            get_state=self._control_get_state,
+            submit=self._control_submit,
+        )
+        self.control_server.start()
+        append_state_log(args.state_log, "CONTROL_SOCKET_LISTENING")
+
         self.model = load_model(args)
+        if hasattr(self.model, "logger"):  # 百炼客户端: 对冲/报错/失败事件写入状态日志
+            self.model.logger = lambda m: append_state_log(args.state_log, m)
         self.model_ready = True
         append_state_log(args.state_log, "MODEL_READY")
         self.write_status(active=self.active, ready=True)
@@ -439,6 +667,7 @@ class SenseVoicePipeline:
         append_state_log(args.state_log, f"DAEMON_START resident={int(args.resident)} active={int(self.active)}")
 
         try:
+          try:
             while not self.stop_flag:
                 if self.force_active is not None:
                     if self.active != self.force_active:
@@ -452,6 +681,9 @@ class SenseVoicePipeline:
                     self.active = not self.active
                     append_state_log(args.state_log, f"CONTROL_TOGGLE active={int(self.active)}")
                     self.write_status(active=self.active, ready=self.model_ready)
+
+                while not self._retry_q.empty():  # 关着收音也能重试
+                    self._run_retry(self._retry_q.get_nowait())
 
                 if self.active and self.proc is None:
                     try:
@@ -468,17 +700,21 @@ class SenseVoicePipeline:
                     time.sleep(0.05)
                     continue
 
-                if self.proc is None or self.proc.stdout is None:
+                if self.proc is None or self._frame_q is None:
                     time.sleep(0.02)
                     continue
 
-                chunk = self.proc.stdout.read(self.frame_bytes)
-                if not chunk or len(chunk) < self.frame_bytes:
-                    if self.proc.poll() is not None:
-                        append_state_log(args.state_log, f"STREAM_PROC_EXIT code={self.proc.returncode}")
-                        self.stop_capture("proc_exit")
-                    else:
-                        time.sleep(0.01)
+                try:
+                    chunk = self._frame_q.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                if chunk is None:  # 读线程见到 EOF：arecord 已退出
+                    try:
+                        self.proc.wait(timeout=2.0)
+                    except Exception:
+                        pass
+                    append_state_log(args.state_log, f"STREAM_PROC_EXIT code={self.proc.returncode}")
+                    self.stop_capture("proc_exit")
                     continue
 
                 is_voiced = self.vad.is_speech(chunk, args.sample_rate)
@@ -517,7 +753,8 @@ class SenseVoicePipeline:
                 )
                 if args.emit_partial and should_partial:
                     samples = np.frombuffer(self.segment, dtype=np.int16).astype(np.float32) / 32768.0
-                    raw_text = transcribe_array(self.model, samples, args.language)
+                    raw_text = transcribe_array(self.model, samples, args.language,
+                                                context=self._build_asr_context())
                     text = sanitize_transcript_text(raw_text, args.language, bool(args.filter_fillers))
                     if raw_text and not text:
                         append_state_log(args.state_log, f"DROP_PARTIAL raw={raw_text}")
@@ -547,9 +784,14 @@ class SenseVoicePipeline:
                         append_state_log(args.state_log, f"PARTIAL text={emit_text}")
                     self.last_partial_ts = now
 
-                should_finalize = self.trailing_silence >= self.end_frames or seg_ms >= args.max_segment_ms
+                end_frames = self.soft_cut_frames if seg_ms >= self.soft_cut_start_ms else self.end_frames
+                should_finalize = self.trailing_silence >= end_frames or seg_ms >= args.max_segment_ms
                 if not should_finalize:
                     continue
+                if seg_ms >= args.max_segment_ms:
+                    append_state_log(args.state_log, f"SEG_MAX_CUT seg_ms={int(seg_ms)}")
+                elif seg_ms >= self.soft_cut_start_ms:
+                    append_state_log(args.state_log, f"SEG_SOFT_CUT seg_ms={int(seg_ms)}")
 
                 if seg_ms >= args.min_segment_ms:
                     samples = np.frombuffer(self.segment, dtype=np.int16).astype(np.float32) / 32768.0
@@ -562,7 +804,24 @@ class SenseVoicePipeline:
                 self.trailing_silence = 0
                 self.segment = bytearray()
                 self.pre_roll.clear()
+          except BaseException as _exc:
+            import traceback as _tb
+            tb_text = "".join(_tb.format_exception(type(_exc), _exc, _exc.__traceback__))
+            append_state_log(
+                args.state_log,
+                f"FATAL_EXCEPTION type={type(_exc).__name__} msg={_exc!s}",
+                level="ERROR",
+            )
+            try:
+                with open(args.state_log + ".traceback", "a", buffering=1) as _tf:
+                    _tf.write(f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} pid={os.getpid()} ===\n")
+                    _tf.write(tb_text)
+            except Exception:
+                pass
+            raise
         finally:
+            if self.control_server is not None:
+                self.control_server.stop()
             self.stop_capture("shutdown")
             if self.indicator:
                 self.indicator.on_shutdown()
@@ -573,3 +832,77 @@ class SenseVoicePipeline:
                 f.write("")
             append_state_log(args.state_log, "DAEMON_STOP")
         return 0
+
+    def _notify_asr_failed(self, seg_ms: float) -> None:
+        """ASR 所有模型都失败/超时：这句话没能输入。日志里 ASR_FAILED 已记录原因，这里再弹桌面通知，
+        避免用户以为"说了没反应"却不知道是识别服务挂了（之前超时是静默丢弃）。"""
+        append_state_log(self.args.state_log, f"ASR_DROPPED seg_ms={int(seg_ms)} 这句话未输入(全部ASR模型失败/超时)")
+        if self.recent is not None:
+            return  # 由 _recent_record 弹带"重新识别"按钮的通知
+        try:
+            import subprocess
+            subprocess.Popen(["notify-send", "-t", "4000", "SenseVoice", "识别失败/超时，这句话没有输入"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+
+    def _control_get_state(self) -> dict:
+        return {
+            "active": int(self.active),
+            "ready": int(self.model_ready),
+            "pid": os.getpid(),
+        }
+
+    def _build_asr_context(self) -> str:
+        """生成 Qwen3-ASR 的 context 字符串(读 config/hotwords.yaml 四组分类)。
+        非 qwen3asr-gpu 后端忽略此返回。yaml 缺失返回空串=不注入。
+        hotwords.py 内部按文件 mtime 缓存,反复调用零开销。
+        """
+        backend = (os.environ.get("SENSEVOICE_ASR_BACKEND") or "").lower()
+        if backend not in ("qwen3asr-gpu", "bailian"):
+            return ""
+        # 路径: <project_root>/config/hotwords.yaml
+        # pipeline.py 在 <project_root>/sensevoice/pipeline.py，只需两层 dirname
+        # 回到 project_root(曾多套一层 dirname，把路径算到了 work/ 上一级，
+        # 导致 yaml 一直读不到、except 悄悄吞掉 —— 热词注入从未真正生效过)。
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        yaml_path = os.path.join(here, "config", "hotwords.yaml")
+        custom = os.environ.get("SENSEVOICE_ASR_CONTEXT_FILE", "").strip()
+        if custom:
+            yaml_path = os.path.expanduser(custom)
+        try:
+            return build_asr_context(yaml_path)
+        except Exception:
+            return ""
+
+    def _control_submit(self, cmd: str) -> dict:
+        # ACTIVATE/DEACTIVATE 直接设 force_active；TOGGLE 增计数。主循环每轮消费。
+        # 模型未 ready 时命令仍被接受（进入待处理状态），ready 后第一轮即生效。
+        #
+        # 注意: 这里返回的 active 必须是"这条命令生效后"的预测值，不能是
+        # self.active 本身 —— self.active 要等主循环下一轮才会真正翻转，
+        # 命令刚排进队列的这一刻它还是旧值。之前直接返回 self.active 导致
+        # toggle_resident_f8.sh 的 ON/OFF 提示永远落后一步、看起来像是反的
+        # (按下去要开，提示却说关；再按一次要关，提示又说开)。
+        if cmd.startswith("RETRY "):
+            eid = cmd.split(None, 1)[1].strip()
+            if self.recent is None or self.recent.get(eid) is None:
+                return {"ok": False, "err": "not_found"}
+            self._retry_q.put(eid)
+            return {"ok": True}
+        if cmd == "ACTIVATE":
+            self.force_active = True
+            predicted_active = True
+        elif cmd == "DEACTIVATE":
+            self.force_active = False
+            predicted_active = False
+        elif cmd == "TOGGLE":
+            self.toggle_count += 1
+            predicted_active = not self.active
+        else:
+            predicted_active = self.active
+        return {
+            "active": int(predicted_active),
+            "ready": int(self.model_ready),
+            "queued": not self.model_ready,
+        }

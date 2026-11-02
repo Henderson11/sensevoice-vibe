@@ -36,7 +36,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--max-segment-ms",
         type=int,
-        default=int(os.environ.get("SENSEVOICE_STREAM_MAX_SEGMENT_MS", "30000")),
+        default=int(os.environ.get("SENSEVOICE_STREAM_MAX_SEGMENT_MS", "180000")),
+    )
+    # 软切：段长进入 [上限-窗口, 上限) 后停顿阈值降到 SOFT_CUT_SILENCE_MS，在最近的短停顿处收尾，
+    # 不在上限处硬切到词中间。窗口=0 关闭软切。
+    p.add_argument(
+        "--soft-cut-window-ms",
+        type=int,
+        default=int(os.environ.get("SENSEVOICE_STREAM_SOFT_CUT_WINDOW_MS", "20000")),
+    )
+    p.add_argument(
+        "--soft-cut-silence-ms",
+        type=int,
+        default=int(os.environ.get("SENSEVOICE_STREAM_SOFT_CUT_SILENCE_MS", "300")),
     )
     p.add_argument(
         "--pre-roll-ms",
@@ -491,4 +503,17 @@ def parse_args() -> argparse.Namespace:
         default=int(os.environ.get("SENSEVOICE_COMPARE_LOG_KEEP_LINES", "300")),
         help="Maximum number of compare JSONL lines to keep",
     )
+    # 最近语音备份：可能是本人说的、但没出字的段落盘到 <state_dir>/recent_audio/，可从通知或面板重试
+    p.add_argument("--recent-enable", type=int, choices=[0, 1],
+                   default=int(os.environ.get("SENSEVOICE_RECENT_ENABLE", "1")))
+    p.add_argument("--recent-max", type=int, default=int(os.environ.get("SENSEVOICE_RECENT_MAX", "50")))
+    p.add_argument("--recent-max-ok", type=int, default=int(os.environ.get("SENSEVOICE_RECENT_MAX_OK", "20")),
+                   help="Keep at most this many successfully injected segments")
+    p.add_argument("--recent-days", type=float, default=float(os.environ.get("SENSEVOICE_RECENT_DAYS", "3")))
+    p.add_argument("--recent-spk-min-score", type=float,
+                   default=float(os.environ.get("SENSEVOICE_RECENT_SPK_MIN_SCORE", "0.40")),
+                   help="Speaker-rejected segments scoring at least this are kept (lower = almost always others)")
+    p.add_argument("--recent-notify-min-ms", type=int,
+                   default=int(os.environ.get("SENSEVOICE_RECENT_NOTIFY_MIN_MS", "5000")),
+                   help="Speaker-rejected kept segments at least this long pop a notification with a retry button")
     return p.parse_args()

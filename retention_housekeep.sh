@@ -24,9 +24,13 @@ is_protected_wav() {
 }
 
 delete_old_wavs_global() {
+  # 声纹注册模板及其备份（speaker_enroll*）绝不能删；recent_audio/ 由 sensevoice/recent.py 自己按 50 条/3 天清理。
+  # 2026-11-02 事故：recent_audio 让 wav 总数超过 KEEP_RECENT，这里按时间删掉了最旧的注册模板，daemon 启动即失败。
   mapfile -t wavs < <(
     find "$STATE_DIR" \
       -path "$STATE_DIR/archive" -prune -o \
+      -path "$STATE_DIR/recent_audio" -prune -o \
+      -path "$STATE_DIR/speaker_enroll*" -prune -o \
       -type f -name '*.wav' -printf '%T@ %p\n' \
       | sort -nr \
       | awk '{ $1=""; sub(/^ /,""); print }'
