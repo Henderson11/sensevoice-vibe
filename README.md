@@ -295,7 +295,9 @@ tail -3 ~/.local/state/sensevoice-vibe/stream_vad.log | grep "FINAL mode"
 | `SENSEVOICE_SPK_ENABLE` | 声纹门禁开关 | 1 |
 | `SENSEVOICE_SPK_THRESHOLD` | 相似度阈值，高=严 | 0.60 |
 | `SENSEVOICE_STREAM_ENDPOINT_MS` | 静音判句尾阈值 (ms) | 1500 |
-| `SENSEVOICE_STREAM_MAX_SEGMENT_MS` | 单段最大时长 (ms) | 30000 |
+| `SENSEVOICE_STREAM_MAX_SEGMENT_MS` | 单段最大时长 (ms) | 180000 |
+| `SENSEVOICE_STREAM_SOFT_CUT_WINDOW_MS` | 软切窗口：上限前这段时间内遇到短停顿就收尾，0=关闭 (ms) | 20000 |
+| `SENSEVOICE_STREAM_SOFT_CUT_SILENCE_MS` | 软切窗口内的停顿阈值 (ms) | 300 |
 | `SENSEVOICE_PROJECT_ROOT` | 项目术语表扫描目录 | $HOME |
 | `SENSEVOICE_INJECT_MODE` | `ibus`（推荐）/ `clipboard`（兼容） | ibus |
 | `SENSEVOICE_LANGUAGE` | `auto`/`zh`/`en`/`yue`/`ja`/`ko` | auto |
@@ -355,7 +357,7 @@ sed -i 's/^SENSEVOICE_POST_LLM_ENABLE=.*/SENSEVOICE_POST_LLM_ENABLE=0/' \
 | LLM 调用超时 | 网络慢 / 服务过载 | `POST_LLM_TIMEOUT_MS` 加大；或换 fallback URL |
 | 改了 `llm.env` 不生效 | 配置在进程启动时载入内存 | `./toggle_resident_f8.sh restart`（按 F8 也会触发：脚本检测到 `llm.env` mtime 比进程新会自动重启） |
 | 说话半截就出字 | VAD endpoint 太短 | `SENSEVOICE_STREAM_ENDPOINT_MS` 加大（默认 1500） |
-| 长句被切两段 | 段长超过 MAX_SEGMENT | `SENSEVOICE_STREAM_MAX_SEGMENT_MS` 加大（默认 30000） |
+| 长句被切两段 | 停顿超过 ENDPOINT_MS，或段长到了 MAX_SEGMENT（默认 180000，上限前 20s 内会在短停顿处软切） | 调大 `SENSEVOICE_STREAM_ENDPOINT_MS` 或 `SENSEVOICE_STREAM_MAX_SEGMENT_MS` |
 | 旁人说话也被识别 | 声纹门禁阈值太低 | `SENSEVOICE_SPK_THRESHOLD` 提高（如 0.6 → 0.7） |
 
 ### 实时观测日志

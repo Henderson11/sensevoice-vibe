@@ -2,8 +2,10 @@
 import collections
 import json
 import os
+import queue
 import signal
 import subprocess
+import threading
 import time
 from typing import Deque, Dict, List, Optional, Tuple
 
@@ -65,8 +67,12 @@ class SenseVoicePipeline:
         self.frame_bytes = self.frame_samples * 2
         self.start_frames = max(1, int(args.start_ms / args.frame_ms))
         self.end_frames = max(1, int(args.endpoint_silence_ms / args.frame_ms))
+        # 软切：段长进入 [上限-窗口, 上限) 后改用短停顿阈值收尾；窗口最多占上限的一半
+        self.soft_cut_frames = min(self.end_frames, max(1, int(args.soft_cut_silence_ms / args.frame_ms)))
+        self.soft_cut_start_ms = max(args.max_segment_ms // 2, args.max_segment_ms - args.soft_cut_window_ms)
         self.pre_roll_frames = max(0, int(args.pre_roll_ms / args.frame_ms))
         self.proc: Optional[subprocess.Popen] = None
+        self._frame_q: Optional["queue.Queue[Optional[bytes]]"] = None
         self.pre_roll: Deque[bytes] = collections.deque(maxlen=self.pre_roll_frames)
         self.in_speech = False
         self.segment_id = 0
@@ -224,10 +230,31 @@ class SenseVoicePipeline:
         self.proc = make_arecord_process(self.args)
         if self.proc.stdout is None:
             raise RuntimeError("arecord stdout unavailable")
+        self._frame_q = queue.Queue(maxsize=50 * 600)  # 20ms 帧，最多积压 10 分钟
+        threading.Thread(target=self._drain_capture, args=(self.proc.stdout, self._frame_q),
+                         daemon=True, name="arecord-reader").start()
         self.indicator.reset_session()
         self.inject("CTRL", "RESET")
         self.reset_capture_state()
         append_state_log(self.args.state_log, "STREAM_START")
+
+    def _drain_capture(self, stdout, frame_q: "queue.Queue[Optional[bytes]]") -> None:
+        """独立线程持续抽干 arecord 管道，切成整帧入队；EOF 时放入 None。
+        主循环同步处理一段（声纹+ASR+润色，3 分钟的段可达 20~30s）期间不读管道，而管道+ALSA
+        只能缓冲约 2.6s，超出部分 arecord 静默丢弃（2026-11-02 实测停读 25s 丢 22s 音频）。"""
+        pending = bytearray()
+        while True:
+            try:
+                data = stdout.read(4096)
+            except (OSError, ValueError):
+                break
+            if not data:
+                break
+            pending.extend(data)
+            while len(pending) >= self.frame_bytes:
+                frame_q.put(bytes(pending[:self.frame_bytes]))
+                del pending[:self.frame_bytes]
+        frame_q.put(None)
 
     def stop_capture(self, reason: str):
         if self.in_speech and self.indicator:
@@ -256,6 +283,7 @@ class SenseVoicePipeline:
             except Exception as e:
                 append_state_log(self.args.state_log, f"STREAM_STOP_WAIT_ERR {type(e).__name__}: {e}")
             self.proc = None
+        self._frame_q = None
 
         # 兜底：扫所有挂在本 daemon 下的孤儿 arecord（self.proc 与 OS 状态可能漂移）
         try:
@@ -560,17 +588,21 @@ class SenseVoicePipeline:
                     time.sleep(0.05)
                     continue
 
-                if self.proc is None or self.proc.stdout is None:
+                if self.proc is None or self._frame_q is None:
                     time.sleep(0.02)
                     continue
 
-                chunk = self.proc.stdout.read(self.frame_bytes)
-                if not chunk or len(chunk) < self.frame_bytes:
-                    if self.proc.poll() is not None:
-                        append_state_log(args.state_log, f"STREAM_PROC_EXIT code={self.proc.returncode}")
-                        self.stop_capture("proc_exit")
-                    else:
-                        time.sleep(0.01)
+                try:
+                    chunk = self._frame_q.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                if chunk is None:  # 读线程见到 EOF：arecord 已退出
+                    try:
+                        self.proc.wait(timeout=2.0)
+                    except Exception:
+                        pass
+                    append_state_log(args.state_log, f"STREAM_PROC_EXIT code={self.proc.returncode}")
+                    self.stop_capture("proc_exit")
                     continue
 
                 is_voiced = self.vad.is_speech(chunk, args.sample_rate)
@@ -640,9 +672,14 @@ class SenseVoicePipeline:
                         append_state_log(args.state_log, f"PARTIAL text={emit_text}")
                     self.last_partial_ts = now
 
-                should_finalize = self.trailing_silence >= self.end_frames or seg_ms >= args.max_segment_ms
+                end_frames = self.soft_cut_frames if seg_ms >= self.soft_cut_start_ms else self.end_frames
+                should_finalize = self.trailing_silence >= end_frames or seg_ms >= args.max_segment_ms
                 if not should_finalize:
                     continue
+                if seg_ms >= args.max_segment_ms:
+                    append_state_log(args.state_log, f"SEG_MAX_CUT seg_ms={int(seg_ms)}")
+                elif seg_ms >= self.soft_cut_start_ms:
+                    append_state_log(args.state_log, f"SEG_SOFT_CUT seg_ms={int(seg_ms)}")
 
                 if seg_ms >= args.min_segment_ms:
                     samples = np.frombuffer(self.segment, dtype=np.int16).astype(np.float32) / 32768.0

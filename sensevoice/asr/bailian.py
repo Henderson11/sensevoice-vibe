@@ -79,12 +79,17 @@ class BailianASRClient:
     def __init__(self, api_key: str, url: str = "", model: str = "qwen-audio-3.0-asr-flash",
                  hotwords_yaml_path: str = "", timeout_sec: float = 15.0,
                  hedge_models=DEFAULT_HEDGE_MODELS, hedge_after_sec: float = 2.5,
+                 timeout_ratio: float = 0.35, hedge_after_ratio: float = 0.1,
                  logger: Optional[Callable[[str], None]] = None):
         self.api_key = api_key
         self.model = model
         self.hotwords_yaml_path = hotwords_yaml_path
         self.timeout_sec = timeout_sec
         self.hedge_after_sec = max(0.3, float(hedge_after_sec))
+        # 长音频识别时延 ≈ 2s + 0.11×音频秒数（2026-11-02 实测 120s≈15s、180s≈22s），超时和对冲阈值
+        # 按音频时长放大：取 max(固定值, 比例×时长)，≤25s 的短句仍是原来的 15s / 2.5s
+        self.timeout_ratio = max(0.0, float(timeout_ratio))
+        self.hedge_after_ratio = max(0.0, float(hedge_after_ratio))
         self.hedge_models = [m.strip() for m in hedge_models if m and m.strip() and m.strip() != model]
         self.logger = logger or (lambda msg: None)
         # 主模型若是兼容协议且调用方给了自定义 URL，沿用；原生协议一律用官方原生地址
@@ -151,8 +156,9 @@ class BailianASRClient:
         return "data:audio/wav;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
 
     # ------------------------------------------------------------ 单模型调用
-    def _call_one(self, model: str, data_uri: str, context: str) -> str:
+    def _call_one(self, model: str, data_uri: str, context: str, timeout_sec: float = 0.0) -> str:
         """返回识别文本（可为空串=无语音）；任何错误抛异常。"""
+        timeout_sec = timeout_sec or self.timeout_sec
         if _is_native(model):
             payload = {
                 "model": model,
@@ -164,7 +170,7 @@ class BailianASRClient:
                 vocab = self._vocabulary()
                 if vocab:
                     payload["parameters"]["vocabulary"] = vocab
-            resp = self._session(model).post(NATIVE_URL, json=payload, timeout=self.timeout_sec)
+            resp = self._session(model).post(NATIVE_URL, json=payload, timeout=timeout_sec)
             if resp.status_code == 400 and "NO_WORDS" in resp.text:
                 return ""  # 纯静音/无词：正常情况
             resp.raise_for_status()
@@ -182,7 +188,7 @@ class BailianASRClient:
         messages.append({"role": "user", "content": [
             {"type": "input_audio", "input_audio": {"data": data_uri}}]})
         resp = self._session(model).post(self._compat_url, json={"model": model, "messages": messages},
-                                         timeout=self.timeout_sec)
+                                         timeout=timeout_sec)
         resp.raise_for_status()
         msg = resp.json()["choices"][0]["message"]["content"]
         if isinstance(msg, list):
@@ -202,8 +208,11 @@ class BailianASRClient:
             return ""
         data_uri = self._encode(samples, sample_rate)
         models = [self.model] + self.hedge_models
+        audio_sec = len(samples) / float(sample_rate)
+        timeout_sec = max(self.timeout_sec, audio_sec * self.timeout_ratio)
+        hedge_after_sec = max(self.hedge_after_sec, audio_sec * self.hedge_after_ratio)
         t0 = time.time()
-        deadline = t0 + self.timeout_sec
+        deadline = t0 + timeout_sec
         done_q: "queue.Queue" = queue.Queue()
         inflight: Dict[object, str] = {}
         state = {"next": 0, "last_launch": t0, "pending": 0}
@@ -214,7 +223,7 @@ class BailianASRClient:
             state["next"] += 1
             state["last_launch"] = time.time()
             state["pending"] += 1
-            f = self._pool.submit(self._call_one, m, data_uri, context)
+            f = self._pool.submit(self._call_one, m, data_uri, context, timeout_sec)
             inflight[f] = m
             f.add_done_callback(done_q.put)
             if state["next"] > 1:
@@ -232,7 +241,7 @@ class BailianASRClient:
                 break
             wait = deadline - now
             if more:
-                wait = min(wait, max(0.0, state["last_launch"] + self.hedge_after_sec - now))
+                wait = min(wait, max(0.0, state["last_launch"] + hedge_after_sec - now))
             try:
                 f = done_q.get(timeout=wait)
             except queue.Empty:
@@ -263,6 +272,6 @@ class BailianASRClient:
         if empty_seen:
             return ""  # 有模型明确返回"无语音"
         self.last_failed = True
-        self.last_error = "; ".join(errors) or f"timeout>{self.timeout_sec}s"
+        self.last_error = "; ".join(errors) or f"timeout>{timeout_sec:.0f}s"
         self._log(f"ASR_FAILED models={models[:state['next']]} err={self.last_error}")
         return ""

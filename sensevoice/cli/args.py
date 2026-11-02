@@ -36,7 +36,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--max-segment-ms",
         type=int,
-        default=int(os.environ.get("SENSEVOICE_STREAM_MAX_SEGMENT_MS", "30000")),
+        default=int(os.environ.get("SENSEVOICE_STREAM_MAX_SEGMENT_MS", "180000")),
+    )
+    # 软切：段长进入 [上限-窗口, 上限) 后停顿阈值降到 SOFT_CUT_SILENCE_MS，在最近的短停顿处收尾，
+    # 不在上限处硬切到词中间。窗口=0 关闭软切。
+    p.add_argument(
+        "--soft-cut-window-ms",
+        type=int,
+        default=int(os.environ.get("SENSEVOICE_STREAM_SOFT_CUT_WINDOW_MS", "20000")),
+    )
+    p.add_argument(
+        "--soft-cut-silence-ms",
+        type=int,
+        default=int(os.environ.get("SENSEVOICE_STREAM_SOFT_CUT_SILENCE_MS", "300")),
     )
     p.add_argument(
         "--pre-roll-ms",

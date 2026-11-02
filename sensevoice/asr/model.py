@@ -54,6 +54,8 @@ def load_model(args: argparse.Namespace):
                 "SENSEVOICE_BAILIAN_HEDGE_MODELS", "fun-asr-flash-2026-06-15,qwen3-asr-flash").split(",") if m.strip()],
             hedge_after_sec=float(os.environ.get("SENSEVOICE_BAILIAN_HEDGE_AFTER_MS", "2500")) / 1000.0,
             timeout_sec=float(os.environ.get("SENSEVOICE_BAILIAN_TIMEOUT_SEC", "15")),
+            timeout_ratio=float(os.environ.get("SENSEVOICE_BAILIAN_TIMEOUT_RATIO", "0.35")),
+            hedge_after_ratio=float(os.environ.get("SENSEVOICE_BAILIAN_HEDGE_AFTER_RATIO", "0.1")),
         )
     if backend == "qwen3asr":
         return Qwen3ASREngine(

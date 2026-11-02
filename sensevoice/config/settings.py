@@ -37,6 +37,10 @@ class SenseVoiceConfig:
             warnings.append(
                 f"MAX_SEGMENT_MS={max_seg_ms} too low"
             )
+        if max_seg_ms > 180000:
+            warnings.append(
+                f"MAX_SEGMENT_MS={max_seg_ms} exceeds tested 180000 (Bailian ASR latency/payload untested)"
+            )
 
         min_seg_ms = getattr(args, "min_segment_ms", 850)
         if min_seg_ms >= endpoint_ms:
@@ -87,6 +91,7 @@ class SenseVoiceConfig:
         lines.append(
             f"  断句           : 停顿={getattr(args, 'endpoint_silence_ms', '?')}ms"
             f" 最长={getattr(args, 'max_segment_ms', '?')}ms"
+            f" 软切=末{getattr(args, 'soft_cut_window_ms', '?')}ms内停顿{getattr(args, 'soft_cut_silence_ms', '?')}ms"
         )
 
         # 声纹门禁

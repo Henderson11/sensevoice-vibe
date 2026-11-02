@@ -250,13 +250,20 @@ class Engine:
                 "SENSEVOICE_BAILIAN_HEDGE_MODELS", "fun-asr-flash-2026-06-15,qwen3-asr-flash").split(",") if m.strip()],
             hedge_after_sec=env_float("SENSEVOICE_BAILIAN_HEDGE_AFTER_MS", 2500) / 1000.0,
             timeout_sec=env_float("SENSEVOICE_BAILIAN_TIMEOUT_SEC", 15),
+            timeout_ratio=env_float("SENSEVOICE_BAILIAN_TIMEOUT_RATIO", 0.35),
+            hedge_after_ratio=env_float("SENSEVOICE_BAILIAN_HEDGE_AFTER_RATIO", 0.1),
             logger=lambda m: log(m),
         )
         self.vad = webrtcvad.Vad(env_int("SENSEVOICE_STREAM_VAD_AGGRESSIVENESS", 2))
         self.end_frames = max(1, env_int("SENSEVOICE_STREAM_ENDPOINT_MS", 1500) // FRAME_MS)
         self.start_frames = max(1, env_int("SENSEVOICE_STREAM_START_MS", 240) // FRAME_MS)
         self.pre_roll_frames = max(1, env_int("SENSEVOICE_STREAM_PRE_ROLL_MS", 700) // FRAME_MS)
-        self.max_segment_ms = env_int("SENSEVOICE_STREAM_MAX_SEGMENT_MS", 30000)
+        self.max_segment_ms = env_int("SENSEVOICE_STREAM_MAX_SEGMENT_MS", 180000)
+        # 软切：段长进入 [上限-窗口, 上限) 后改用短停顿阈值收尾，不在上限处硬切到词中间（与 Linux 版同逻辑）
+        self.soft_cut_frames = min(self.end_frames,
+                                   max(1, env_int("SENSEVOICE_STREAM_SOFT_CUT_SILENCE_MS", 300) // FRAME_MS))
+        self.soft_cut_start_ms = max(self.max_segment_ms // 2,
+                                     self.max_segment_ms - env_int("SENSEVOICE_STREAM_SOFT_CUT_WINDOW_MS", 20000))
         self.min_segment_ms = env_int("SENSEVOICE_STREAM_MIN_SEGMENT_MS", 400)
         self.inject_mode = os.environ.get("WINVOICE_INJECT_MODE", "type").lower()
         self.input_spec = os.environ.get("WINVOICE_INPUT_DEVICE", "")
@@ -468,11 +475,16 @@ class Engine:
         self.segment.extend(frame)
         self.trailing = 0 if voiced else self.trailing + 1
         seg_ms = len(self.segment) * 1000 // (SR * 2)
-        if self.trailing >= self.end_frames or seg_ms >= self.max_segment_ms:
+        end_frames = self.soft_cut_frames if seg_ms >= self.soft_cut_start_ms else self.end_frames
+        if self.trailing >= end_frames or seg_ms >= self.max_segment_ms:
             seg = bytes(self.segment)
             self._reset_segmenter()
             if seg_ms >= self.min_segment_ms:
                 self.pool.submit(self._process, seg, seg_ms)
+            if seg_ms >= self.max_segment_ms:
+                log(f"SEG_MAX_CUT seg_ms={seg_ms}")
+            elif seg_ms >= self.soft_cut_start_ms:
+                log(f"SEG_SOFT_CUT seg_ms={seg_ms}")
             log("SPEECH_END")
 
     # ---- 一段话的处理：ASR → 润色 → 注入（单线程串行，保证顺序）
