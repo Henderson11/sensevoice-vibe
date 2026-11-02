@@ -1,7 +1,6 @@
-"""SenseVoice 语音输入管线 - 协调所有子系统的主循环"""
+"""语音输入主循环：采集 → VAD 分段 → 声纹门禁 → 百炼云端识别 → LLM 润色 → IBus 输入。"""
 import collections
 import concurrent.futures
-import json
 import os
 import queue
 import signal
@@ -13,18 +12,10 @@ from typing import Deque, Dict, List, Optional, Tuple
 import numpy as np
 import webrtcvad
 
-from sensevoice.text.processing import (
-    common_prefix, compact_log_text, gate_with_wake_words,
-    looks_like_partial_noise, parse_wake_words, sanitize_transcript_text,
-)
-from sensevoice.asr.confidence import _select_focus_low_tokens
+from sensevoice.text.processing import compact_log_text, sanitize_transcript_text
 from sensevoice.config.settings import SenseVoiceConfig
-from sensevoice.asr.router import ConfidenceRouter
-from sensevoice.asr.model import load_model, transcribe_array, transcribe_array_with_conf
-from sensevoice.lexicon.hotwords import build_context as build_asr_context
+from sensevoice.asr.model import load_asr_client
 from sensevoice.inject.ibus import IBusInjector
-from sensevoice.inject.clipboard import FocusInjector
-from sensevoice.ui.indicator import SpeechIndicator
 from sensevoice.llm.postprocessor import LLMPostProcessor
 from sensevoice.speaker.verifier import SpeakerVerifierGate
 from sensevoice.lexicon.project import ProjectLexicon
@@ -35,16 +26,12 @@ from sensevoice.recent import RecentStore
 
 
 class SenseVoicePipeline:
-    """协调 VAD → ASR → 声纹 → LLM → 注入 的完整管线"""
-
     def __init__(self, args):
         self.args = args
         self.state_dir = os.path.dirname(args.state_log)
         os.makedirs(self.state_dir, exist_ok=True)
-        self.pid_file = os.path.join(self.state_dir, "resident.pid")
-        self.status_file = os.path.join(self.state_dir, "resident.status")
 
-        # --- 状态 ---
+        # --- 状态（控制 socket 写入，主循环每轮消费）---
         self.active = args.active_on_start if args.resident else True
         self.model_ready = False
         self.stop_flag = False
@@ -52,16 +39,12 @@ class SenseVoicePipeline:
         self.force_active: Optional[bool] = None
 
         # --- 组件（_init_components 中赋值，提前声明避免 finally 中 AttributeError）---
-        from typing import Union
-        self.model: Optional[object] = None
-        self.indicator: Optional[SpeechIndicator] = None
-        self.injector: Optional[Union[IBusInjector, FocusInjector]] = None
+        self.model = None
+        self.injector: Optional[IBusInjector] = None
         self.speaker_gate: Optional[SpeakerVerifierGate] = None
         self.post_llm: Optional[LLMPostProcessor] = None
         self.project_lexicon: Optional[ProjectLexicon] = None
-        self.conf_router: Optional[ConfidenceRouter] = None
         self.vad = None  # type: ignore[assignment]  # webrtcvad.Vad
-        self.inject_mode_name: str = ""
         self.control_server: Optional[ControlServer] = None
 
         # --- VAD 状态 ---
@@ -93,19 +76,9 @@ class SenseVoicePipeline:
         self.speech_frames = 0
         self.trailing_silence = 0
         self.segment = bytearray()
-        self.last_partial_ts = 0.0
-        self.last_partial_text = ""
-        self.prev_partial_hyp = ""
-
-        # --- 唤醒词 ---
-        self.wake_words = parse_wake_words(args.wake_words)
-        self.wake_enabled = len(self.wake_words) > 0
-        self.wake_strip = bool(args.wake_strip)
 
     def _init_components(self):
-        """初始化所有子系统组件"""
         args = self.args
-
         self.speaker_gate = SpeakerVerifierGate(
             enabled=bool(args.speaker_verify),
             enroll_wav=args.speaker_enroll_wav,
@@ -151,8 +124,7 @@ class SenseVoicePipeline:
             dynamic_max_tokens=bool(args.post_llm_dynamic_max_tokens),
             output_token_factor=args.post_llm_output_token_factor,
         )
-        # 设置 fallback API 端点（内网不可用时降级到官方 API）
-        assert self.post_llm is not None
+        # fallback API 端点（内网网关不可用时降级到官方 API）
         self.post_llm.fallback_url = getattr(args, 'post_llm_fallback_base_url', '') or ''
         self.post_llm.fallback_api_key = getattr(args, 'post_llm_fallback_api_key', '') or ''
         if self.post_llm.fallback_url:
@@ -165,48 +137,20 @@ class SenseVoicePipeline:
             min_term_len=args.project_lexicon_min_term_len,
             extra_terms_file=args.project_lexicon_extra_file,
         )
-        self.conf_router = ConfidenceRouter(
-            enabled=bool(args.conf_route),
-            high=args.conf_high,
-            low=args.conf_low,
-        )
-
-        if args.inject_mode == "ibus":
-            self.injector = IBusInjector()
-        else:
-            self.injector = FocusInjector(args.inject_script)
-        self.inject_mode_name = args.inject_mode
-
-        self.indicator = SpeechIndicator(args.indicator)
+        self.injector = IBusInjector()
         self.vad = webrtcvad.Vad(args.vad_aggressiveness)
 
     def _log_startup(self):
-        """输出启动配置日志"""
         assert self.speaker_gate is not None
         assert self.post_llm is not None
         assert self.project_lexicon is not None
-        assert self.conf_router is not None
         args = self.args
         log = args.state_log
-
-        # 简洁摘要（人类可读）
         for line in SenseVoiceConfig.summary(args).split("\n"):
             append_state_log(log, line)
-
-        # 关键组件状态（机器可解析）
         append_state_log(log, f"SPK_GATE enabled={int(self.speaker_gate.enabled)} threshold={args.speaker_threshold} enroll_n={self.speaker_gate.enroll_count} reason={self.speaker_gate.reason}")
         append_state_log(log, f"POST_LLM enabled={int(self.post_llm.enabled)} model={self.post_llm.model or '-'} fallback={self.post_llm.fallback_model or '-'} reason={self.post_llm.reason}")
         append_state_log(log, f"LEXICON enabled={int(self.project_lexicon.enabled)} terms={len(self.project_lexicon.terms)} reason={self.project_lexicon.reason}")
-        append_state_log(log, f"CONF_ROUTE enabled={int(bool(args.conf_route))} high={self.conf_router.high} low={self.conf_router.low}")
-
-    def write_status(self, active: bool, ready: bool, stopping: bool = False):
-        with open(self.status_file, "w", encoding="utf-8") as f:
-            f.write(f"pid={os.getpid()}\n")
-            f.write(f"resident={int(self.args.resident)}\n")
-            f.write(f"ready={int(ready)}\n")
-            f.write(f"active={int(active)}\n")
-            f.write(f"stopping={int(stopping)}\n")
-            f.write(f"updated={int(time.time())}\n")
 
     def inject(self, mode: str, text: str, critical: bool = False) -> bool:
         assert self.injector is not None
@@ -234,12 +178,8 @@ class SenseVoicePipeline:
         self.trailing_silence = 0
         self.segment = bytearray()
         self._spk_futs, self._spk_win_done = [], 0
-        self.last_partial_ts = 0.0
-        self.last_partial_text = ""
-        self.prev_partial_hyp = ""
 
     def start_capture(self):
-        assert self.indicator is not None
         if self.proc is not None:
             return
         self.proc = make_arecord_process(self.args)
@@ -248,7 +188,6 @@ class SenseVoicePipeline:
         self._frame_q = queue.Queue(maxsize=50 * 600)  # 20ms 帧，最多积压 10 分钟
         threading.Thread(target=self._drain_capture, args=(self.proc.stdout, self._frame_q),
                          daemon=True, name="arecord-reader").start()
-        self.indicator.reset_session()
         self.inject("CTRL", "RESET")
         self.reset_capture_state()
         append_state_log(self.args.state_log, "STREAM_START")
@@ -272,8 +211,7 @@ class SenseVoicePipeline:
         frame_q.put(None)
 
     def stop_capture(self, reason: str):
-        if self.in_speech and self.indicator:
-            self.indicator.on_speech_end()
+        if self.in_speech:
             append_state_log(self.args.state_log, "SPEECH_END")
 
         # 已知子进程：SIGTERM → 2s 等待 → SIGKILL → 短等待
@@ -349,8 +287,7 @@ class SenseVoicePipeline:
         append_state_log(self.args.state_log, f"STREAM_STOP reason={reason}")
 
     def _setup_signals(self):
-        # faulthandler：捕获 SIGSEGV/SIGABRT/SIGFPE/SIGBUS 等致命错误的 traceback
-        # 写到独立文件，避免与 stdout 抢 buffer
+        # faulthandler：捕获 SIGSEGV/SIGABRT/SIGFPE/SIGBUS 等致命错误的 traceback，写到独立文件
         import faulthandler
         fault_log_path = self.args.state_log.replace(".log", ".fault.log")
         if not fault_log_path.endswith(".fault.log"):
@@ -370,23 +307,8 @@ class SenseVoicePipeline:
             )
             self.stop_flag = True
 
-        def _toggle(_sig, _frame):
-            self.toggle_count += 1
-
-        def _activate(_sig, _frame):
-            self.force_active = True
-
-        def _deactivate(_sig, _frame):
-            self.force_active = False
-
         signal.signal(signal.SIGINT, _stop)
         signal.signal(signal.SIGTERM, _stop)
-        if hasattr(signal, "SIGUSR1"):
-            signal.signal(signal.SIGUSR1, _toggle)
-        if hasattr(signal, "SIGUSR2"):
-            signal.signal(signal.SIGUSR2, _activate)
-        if hasattr(signal, "SIGHUP"):
-            signal.signal(signal.SIGHUP, _deactivate)
         append_state_log(self.args.state_log, f"SIGNAL_TRAPS_INSTALLED faulthandler={fault_log_path}")
 
     def _spk_score_window(self, pcm: bytes) -> Tuple[float, float, float]:
@@ -432,7 +354,6 @@ class SenseVoicePipeline:
         assert self.speaker_gate is not None
         assert self.post_llm is not None
         assert self.project_lexicon is not None
-        assert self.conf_router is not None
         assert self.injector is not None
         args = self.args
 
@@ -440,17 +361,11 @@ class SenseVoicePipeline:
             "ts": time.strftime("%F %T"), "seg_id": int(self.segment_id),
             "seg_ms": int(seg_ms), "raw_asr": "", "after_sanitize": "",
             "spk_pass": None, "spk_score": None, "spk_thr": None,
-            "after_wake": None, "after_memory": None,
-            "conf_source": "", "conf_native": None,
-            "conf_tokens": [], "conf_low_tokens": [],
-            "conf_score": None, "conf_route": None, "llm_action": "none",
-            "after_llm": None, "after_lexicon": None,
+            "llm_action": "none", "after_llm": None, "after_lexicon": None,
             "final_injected": "", "inject_ok": 0, "drop_reason": "",
         }
-        spk_score_for_conf: Optional[float] = None
-        spk_thr_for_conf: Optional[float] = None
 
-        # 1. 先声纹验证——不通过则跳过 ASR，节省推理开销
+        # 1. 先声纹验证——不通过则不调用云端 ASR（也不把旁人的语音传上云）
         if retry_entry is not None:
             spk_ok, spk_reason = True, "retry"
             spk_score = float(retry_entry.get("spk_score") or 0.0)
@@ -474,8 +389,6 @@ class SenseVoicePipeline:
         # 声纹通过（手动重试不喂给自适应阈值/自动注册）
         if self.speaker_gate.requested and self.speaker_gate.enabled and retry_entry is None:
             append_state_log(args.state_log, f"SPK_PASS score={spk_score:.3f} thr={spk_thr:.3f} reason={spk_reason}")
-            spk_score_for_conf = float(spk_score)
-            spk_thr_for_conf = float(spk_thr)
             self.speaker_gate.on_success(spk_score, seg_ms, "")
             added, add_info = self.speaker_gate.maybe_auto_enroll(samples, args.sample_rate, seg_ms, spk_score)
             if added:
@@ -483,102 +396,58 @@ class SenseVoicePipeline:
             elif add_info not in ("auto_off", "score_low", "cooldown"):
                 append_state_log(args.state_log, f"SPK_AUTO_ENROLL_SKIP reason={add_info} score={spk_score:.3f} n={self.speaker_gate.enroll_count}")
 
-        # 2. ASR 识别（只有声纹通过才执行）
-        #    qwen3asr-gpu 后端额外注入 4 组热词 context 做 biasing(其他后端忽略 context)
-        asr_context = self._build_asr_context()
-        raw_final_text, native_conf_score, conf_source, native_token_scores = transcribe_array_with_conf(
-            self.model, samples, args.language, context=asr_context
-        )
-        asr_failed = bool(getattr(self.model, "last_failed", False))
+        # 2. 云端 ASR（热词与前文上下文由百炼客户端自己带上）
+        raw_final_text = self.model.transcribe_samples(samples, args.sample_rate)
+        asr_failed = bool(self.model.last_failed)
         if asr_failed:
             self._notify_asr_failed(seg_ms)
         final_text = sanitize_transcript_text(raw_final_text, args.language, bool(args.filter_fillers))
         compare_rec["raw_asr"] = raw_final_text
         compare_rec["after_sanitize"] = final_text
-        compare_rec["conf_source"] = conf_source
-        compare_rec["conf_native"] = native_conf_score
-        compare_rec["conf_tokens"] = native_token_scores
-
         if raw_final_text and not final_text:
             append_state_log(args.state_log, f"DROP_FINAL raw={raw_final_text}")
             compare_rec["drop_reason"] = "sanitize_drop"
 
-        # 3. 后续处理（唤醒词、LLM、注入）
+        # 3. LLM 润色 → 项目术语标准化 → 注入
         if final_text:
-            if self.wake_enabled:
-                gated_final, matched_wake = gate_with_wake_words(final_text, self.wake_words, args.wake_strategy, self.wake_strip)
-                if not gated_final:
-                    append_state_log(args.state_log, f"DROP_FINAL_WAKE raw={final_text}")
-                    compare_rec["drop_reason"] = "wake_gate"
+            glossary: List[str] = self.project_lexicon.hints_for_text(final_text) if self.project_lexicon.enabled else []
+            if self.post_llm.enabled:
+                llm_src = final_text
+                revised = self.post_llm.process(final_text, route="high", glossary=glossary)
+                if revised != final_text:
+                    compare_rec["llm_action"] = "apply"
+                    append_state_log(args.state_log, "POST_LLM_APPLY src={} dst={}".format(compact_log_text(final_text), compact_log_text(revised)))
+                elif self.post_llm.last_error:
+                    compare_rec["llm_action"] = "skip_error"
+                    append_state_log(args.state_log, f"POST_LLM_SKIP reason={self.post_llm.last_error}")
+                else:
+                    compare_rec["llm_action"] = "pass"
+                    append_state_log(args.state_log, "POST_LLM_PASS text={}".format(compact_log_text(final_text)))
+                if args.post_llm_strict and self.post_llm.last_error:
+                    append_state_log(args.state_log, "POST_LLM_BLOCK src={} reason={}".format(compact_log_text(llm_src), self.post_llm.last_error))
                     final_text = ""
                 else:
-                    final_text = gated_final
-                    if matched_wake:
-                        append_state_log(args.state_log, f"WAKE_MATCH wake={matched_wake} final={final_text}")
-            compare_rec["after_wake"] = final_text
+                    final_text = revised
+            else:
+                compare_rec["llm_action"] = "disabled"
+            compare_rec["after_llm"] = final_text
+
+            if final_text and self.project_lexicon.enabled:
+                lex_text = self.project_lexicon.normalize_text(final_text)
+                if lex_text != final_text:
+                    append_state_log(args.state_log, "LEXICON_APPLY src={} dst={}".format(compact_log_text(final_text), compact_log_text(lex_text)))
+                    final_text = lex_text
+            compare_rec["after_lexicon"] = final_text
 
             if final_text:
-                compare_rec["after_memory"] = final_text
-                conf_score = self.conf_router.estimate(
-                    raw_final_text, final_text, self.prev_partial_hyp, seg_ms,
-                    spk_score_for_conf, spk_thr_for_conf,
-                    native_conf=native_conf_score, native_token_scores=native_token_scores,
-                )
-                conf_source_used = f"{conf_source}:focus_agg" if native_token_scores else (conf_source if native_conf_score is not None else f"fallback_heuristic:{conf_source}")
-                conf_route = self.conf_router.route(conf_score)
-                low_tokens = _select_focus_low_tokens(native_token_scores, limit=4) if native_token_scores else []
-                append_state_log(args.state_log, f"CONF_SCORE score={conf_score:.3f} route={conf_route} seg_ms={int(seg_ms)} source={conf_source_used}")
-                compare_rec.update({"conf_source": conf_source_used, "conf_low_tokens": low_tokens, "conf_score": round(float(conf_score), 4), "conf_route": conf_route})
-
-                glossary: List[str] = []
-                if self.project_lexicon.enabled:
-                    glossary = self.project_lexicon.hints_for_text(final_text)
-                focus_token_texts = [str(x.get("token", "")).strip() for x in low_tokens if str(x.get("token", "")).strip()]
-
-                allow_high_route_rewrite = self.post_llm.mode in {"polish_coding", "polish_coding_aggressive"}
-                if self.post_llm.enabled and (conf_route != "high" or allow_high_route_rewrite):
-                    llm_src = final_text
-                    revised = self.post_llm.process(final_text, route=conf_route, glossary=glossary, focus_tokens=focus_token_texts)
-                    if revised != final_text:
-                        compare_rec["llm_action"] = "apply"
-                        append_state_log(args.state_log, "POST_LLM_APPLY src={} dst={} route={}".format(compact_log_text(final_text), compact_log_text(revised), conf_route))
-                    elif self.post_llm.last_error:
-                        compare_rec["llm_action"] = "skip_error"
-                        append_state_log(args.state_log, f"POST_LLM_SKIP reason={self.post_llm.last_error} route={conf_route}")
-                    else:
-                        compare_rec["llm_action"] = "pass"
-                        append_state_log(args.state_log, "POST_LLM_PASS text={} route={}".format(compact_log_text(final_text), conf_route))
-                    if args.post_llm_strict and self.post_llm.last_error:
-                        append_state_log(args.state_log, "POST_LLM_BLOCK src={} reason={}".format(compact_log_text(llm_src), self.post_llm.last_error))
-                        final_text = ""
-                    else:
-                        final_text = revised
-                    compare_rec["after_llm"] = final_text
-                elif self.post_llm.enabled:
-                    compare_rec["llm_action"] = "skip_high_conf"
-                    append_state_log(args.state_log, "POST_LLM_SKIP reason=high_conf_route")
+                compare_rec["final_injected"] = final_text
+                ok_inject = self.inject("COMMIT", final_text, critical=True)  # IBus 引擎直接 commit_text，不回车
+                compare_rec["inject_ok"] = int(ok_inject)
+                if ok_inject:
+                    append_state_log(args.state_log, f"FINAL mode=COMMIT text={final_text}")
+                    self.model.remember(final_text)  # 百炼 *-message：作为下一句的前文
                 else:
-                    compare_rec["llm_action"] = "disabled"
-                    compare_rec["after_llm"] = final_text
-
-                if final_text and self.project_lexicon.enabled:
-                    lex_text = self.project_lexicon.normalize_text(final_text)
-                    if lex_text != final_text:
-                        append_state_log(args.state_log, "LEXICON_APPLY src={} dst={}".format(compact_log_text(final_text), compact_log_text(lex_text)))
-                        final_text = lex_text
-                compare_rec["after_lexicon"] = final_text
-
-                if final_text:
-                    mode = "FINAL" if args.auto_enter else "PARTIAL"
-                    compare_rec["final_injected"] = final_text
-                    ok_inject = self.inject(mode, final_text, critical=True)
-                    compare_rec["inject_ok"] = int(ok_inject)
-                    if ok_inject:
-                        append_state_log(args.state_log, f"FINAL mode={mode} text={final_text}")
-                        if hasattr(self.model, "remember"):  # 百炼 *-message：作为下一句的前文
-                            self.model.remember(final_text)
-                    else:
-                        compare_rec["drop_reason"] = "inject_fail"
+                    compare_rec["drop_reason"] = "inject_fail"
 
         if bool(args.compare_log):
             append_jsonl_bounded(args.compare_log_file, compare_rec, keep_lines=args.compare_log_keep_lines)
@@ -675,29 +544,20 @@ class SenseVoicePipeline:
         append_state_log(args.state_log, f"RETRY_DONE id={eid}")
 
     def run(self) -> int:
-        """运行主循环"""
         args = self.args
 
-        with open(self.pid_file, "w", encoding="utf-8") as f:
-            f.write(str(os.getpid()))
-
-        warnings = SenseVoiceConfig.validate(args)
-        for w in warnings:
+        for w in SenseVoiceConfig.validate(args):
             append_state_log(args.state_log, f"CONFIG_WARN {w}", level="WARN")
 
         self._init_components()
         if not (self.speaker_gate.requested and self.speaker_gate.enabled):
             self._spk_win_bytes = 0  # 没开声纹门禁就不做逐窗计算
-        assert self.indicator is not None
         assert self.injector is not None
         assert self.vad is not None
         self._log_startup()
-        self.write_status(active=self.active, ready=False)
         self._setup_signals()
 
-        # 控制 socket 在模型加载前就 listen ——
-        # toggle 脚本的命令在加载期间也能进队列，主循环 ready 后立即消费。
-        # 替代 SIGHUP/USR2 + status 文件这套脏 IPC。
+        # 控制 socket 在识别客户端就绪前就 listen：F8 的命令在启动期间也能进队列，ready 后立即消费
         self.control_server = ControlServer(
             get_state=self._control_get_state,
             submit=self._control_submit,
@@ -705,13 +565,10 @@ class SenseVoicePipeline:
         self.control_server.start()
         append_state_log(args.state_log, "CONTROL_SOCKET_LISTENING")
 
-        self.model = load_model(args)
-        if hasattr(self.model, "logger"):  # 百炼客户端: 对冲/报错/失败事件写入状态日志
-            self.model.logger = lambda m: append_state_log(args.state_log, m)
+        self.model = load_asr_client()
+        self.model.logger = lambda m: append_state_log(args.state_log, m)  # 对冲/报错/失败/用量事件写入状态日志
         self.model_ready = True
         append_state_log(args.state_log, "MODEL_READY")
-        self.write_status(active=self.active, ready=True)
-        append_state_log(args.state_log, f"INJECTOR={self.inject_mode_name}")
         append_state_log(args.state_log, f"DAEMON_START resident={int(args.resident)} active={int(self.active)}")
 
         try:
@@ -721,14 +578,12 @@ class SenseVoicePipeline:
                     if self.active != self.force_active:
                         self.active = self.force_active
                         append_state_log(args.state_log, f"CONTROL_FORCE active={int(self.active)}")
-                        self.write_status(active=self.active, ready=self.model_ready)
                     self.force_active = None
 
                 while self.toggle_count > 0:
                     self.toggle_count -= 1
                     self.active = not self.active
                     append_state_log(args.state_log, f"CONTROL_TOGGLE active={int(self.active)}")
-                    self.write_status(active=self.active, ready=self.model_ready)
 
                 while not self._retry_q.empty():  # 关着收音也能重试
                     self._run_retry(self._retry_q.get_nowait())
@@ -777,12 +632,8 @@ class SenseVoicePipeline:
                             self.trailing_silence = 0
                             self.segment = bytearray(b"".join(self.pre_roll))
                             self._spk_futs, self._spk_win_done = [], 0
-                            self.last_partial_ts = 0.0
-                            self.last_partial_text = ""
-                            self.prev_partial_hyp = ""
                             self.inject("SEG", str(self.segment_id))
                             append_state_log(args.state_log, f"SEG id={self.segment_id}")
-                            self.indicator.on_speech_start()
                             append_state_log(args.state_log, "SPEECH_START")
                     else:
                         self.speech_frames = 0
@@ -798,45 +649,7 @@ class SenseVoicePipeline:
                 else:
                     self.trailing_silence += 1
 
-                now = time.time()
                 seg_ms = len(self.segment) * 1000 / (args.sample_rate * 2)
-                should_partial = (
-                    seg_ms >= args.min_partial_ms
-                    and now - self.last_partial_ts >= args.partial_interval_ms / 1000.0
-                )
-                if args.emit_partial and should_partial:
-                    samples = np.frombuffer(self.segment, dtype=np.int16).astype(np.float32) / 32768.0
-                    raw_text = transcribe_array(self.model, samples, args.language,
-                                                context=self._build_asr_context())
-                    text = sanitize_transcript_text(raw_text, args.language, bool(args.filter_fillers))
-                    if raw_text and not text:
-                        append_state_log(args.state_log, f"DROP_PARTIAL raw={raw_text}")
-                    emit_text = ""
-                    if text:
-                        if args.partial_strategy == "stable2":
-                            if self.prev_partial_hyp:
-                                emit_text = common_prefix(self.prev_partial_hyp, text).rstrip()
-                            self.prev_partial_hyp = text
-                        else:
-                            emit_text = text
-
-                    if (
-                        emit_text
-                        and not looks_like_partial_noise(emit_text)
-                        and emit_text != self.last_partial_text
-                        and emit_text.startswith(self.last_partial_text)
-                    ):
-                        if self.wake_enabled:
-                            gated_partial, _ = gate_with_wake_words(emit_text, self.wake_words, args.wake_strategy, self.wake_strip)
-                            if not gated_partial:
-                                self.last_partial_ts = now
-                                continue
-                            emit_text = gated_partial
-                        self.inject("PARTIAL", emit_text)
-                        self.last_partial_text = emit_text
-                        append_state_log(args.state_log, f"PARTIAL text={emit_text}")
-                    self.last_partial_ts = now
-
                 end_frames = self.soft_cut_frames if seg_ms >= self.soft_cut_start_ms else self.end_frames
                 should_finalize = self.trailing_silence >= end_frames or seg_ms >= args.max_segment_ms
                 if not should_finalize:
@@ -853,7 +666,6 @@ class SenseVoicePipeline:
                     spk_windows = (self._spk_futs, bytes(self.segment[self._spk_win_done:voiced_end])) if self._spk_futs else None
                     self._process_finalized_segment(samples, seg_ms, spk_windows=spk_windows)
 
-                self.indicator.on_speech_end()
                 append_state_log(args.state_log, "SPEECH_END")
                 self.in_speech = False
                 self.speech_frames = 0
@@ -879,24 +691,18 @@ class SenseVoicePipeline:
             if self.control_server is not None:
                 self.control_server.stop()
             self.stop_capture("shutdown")
-            if self.indicator:
-                self.indicator.on_shutdown()
             if self.injector:
                 self.injector.close()
-            self.write_status(active=False, ready=self.model_ready, stopping=True)
-            with open(self.pid_file, "w", encoding="utf-8") as f:
-                f.write("")
             append_state_log(args.state_log, "DAEMON_STOP")
         return 0
 
     def _notify_asr_failed(self, seg_ms: float) -> None:
-        """ASR 所有模型都失败/超时：这句话没能输入。日志里 ASR_FAILED 已记录原因，这里再弹桌面通知，
-        避免用户以为"说了没反应"却不知道是识别服务挂了（之前超时是静默丢弃）。"""
+        """ASR 所有模型都失败/超时：这句话没能输入。日志里 ASR_FAILED 已记录原因；开着最近语音备份时
+        由 _recent_record 弹带"重新识别"按钮的通知，否则这里弹一条普通通知，避免静默丢句。"""
         append_state_log(self.args.state_log, f"ASR_DROPPED seg_ms={int(seg_ms)} 这句话未输入(全部ASR模型失败/超时)")
         if self.recent is not None:
-            return  # 由 _recent_record 弹带"重新识别"按钮的通知
+            return
         try:
-            import subprocess
             subprocess.Popen(["notify-send", "-t", "4000", "SenseVoice", "识别失败/超时，这句话没有输入"],
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception:
@@ -909,37 +715,10 @@ class SenseVoicePipeline:
             "pid": os.getpid(),
         }
 
-    def _build_asr_context(self) -> str:
-        """生成 Qwen3-ASR 的 context 字符串(读 config/hotwords.yaml 四组分类)。
-        非 qwen3asr-gpu 后端忽略此返回。yaml 缺失返回空串=不注入。
-        hotwords.py 内部按文件 mtime 缓存,反复调用零开销。
-        """
-        backend = (os.environ.get("SENSEVOICE_ASR_BACKEND") or "").lower()
-        if backend not in ("qwen3asr-gpu", "bailian"):
-            return ""
-        # 路径: <project_root>/config/hotwords.yaml
-        # pipeline.py 在 <project_root>/sensevoice/pipeline.py，只需两层 dirname
-        # 回到 project_root(曾多套一层 dirname，把路径算到了 work/ 上一级，
-        # 导致 yaml 一直读不到、except 悄悄吞掉 —— 热词注入从未真正生效过)。
-        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        yaml_path = os.path.join(here, "config", "hotwords.yaml")
-        custom = os.environ.get("SENSEVOICE_ASR_CONTEXT_FILE", "").strip()
-        if custom:
-            yaml_path = os.path.expanduser(custom)
-        try:
-            return build_asr_context(yaml_path)
-        except Exception:
-            return ""
-
     def _control_submit(self, cmd: str) -> dict:
-        # ACTIVATE/DEACTIVATE 直接设 force_active；TOGGLE 增计数。主循环每轮消费。
-        # 模型未 ready 时命令仍被接受（进入待处理状态），ready 后第一轮即生效。
-        #
-        # 注意: 这里返回的 active 必须是"这条命令生效后"的预测值，不能是
-        # self.active 本身 —— self.active 要等主循环下一轮才会真正翻转，
-        # 命令刚排进队列的这一刻它还是旧值。之前直接返回 self.active 导致
-        # toggle_resident_f8.sh 的 ON/OFF 提示永远落后一步、看起来像是反的
-        # (按下去要开，提示却说关；再按一次要关，提示又说开)。
+        # ACTIVATE/DEACTIVATE 直接设 force_active；TOGGLE 增计数；RETRY 排进重试队列。主循环每轮消费。
+        # 返回的 active 必须是"这条命令生效后"的预测值：self.active 要等主循环下一轮才翻转，
+        # 直接返回它会让 F8 的 ON/OFF 提示永远落后一步、看起来是反的。
         if cmd.startswith("RETRY "):
             eid = cmd.split(None, 1)[1].strip()
             if self.recent is None or self.recent.get(eid) is None:
