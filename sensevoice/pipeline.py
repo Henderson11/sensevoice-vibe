@@ -400,6 +400,8 @@ class SenseVoicePipeline:
         raw_final_text, native_conf_score, conf_source, native_token_scores = transcribe_array_with_conf(
             self.model, samples, args.language, context=asr_context
         )
+        if getattr(self.model, "last_failed", False):
+            self._notify_asr_failed(seg_ms)
         final_text = sanitize_transcript_text(raw_final_text, args.language, bool(args.filter_fillers))
         compare_rec["raw_asr"] = raw_final_text
         compare_rec["after_sanitize"] = final_text
@@ -519,6 +521,8 @@ class SenseVoicePipeline:
         append_state_log(args.state_log, "CONTROL_SOCKET_LISTENING")
 
         self.model = load_model(args)
+        if hasattr(self.model, "logger"):  # 百炼客户端: 对冲/报错/失败事件写入状态日志
+            self.model.logger = lambda m: append_state_log(args.state_log, m)
         self.model_ready = True
         append_state_log(args.state_log, "MODEL_READY")
         self.write_status(active=self.active, ready=True)
@@ -680,6 +684,17 @@ class SenseVoicePipeline:
             append_state_log(args.state_log, "DAEMON_STOP")
         return 0
 
+    def _notify_asr_failed(self, seg_ms: float) -> None:
+        """ASR 所有模型都失败/超时：这句话没能输入。日志里 ASR_FAILED 已记录原因，这里再弹桌面通知，
+        避免用户以为"说了没反应"却不知道是识别服务挂了（之前超时是静默丢弃）。"""
+        append_state_log(self.args.state_log, f"ASR_DROPPED seg_ms={int(seg_ms)} 这句话未输入(全部ASR模型失败/超时)")
+        try:
+            import subprocess
+            subprocess.Popen(["notify-send", "-t", "4000", "SenseVoice", "识别失败/超时，这句话没有输入"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+
     def _control_get_state(self) -> dict:
         return {
             "active": int(self.active),
@@ -693,10 +708,13 @@ class SenseVoicePipeline:
         hotwords.py 内部按文件 mtime 缓存,反复调用零开销。
         """
         backend = (os.environ.get("SENSEVOICE_ASR_BACKEND") or "").lower()
-        if backend != "qwen3asr-gpu":
+        if backend not in ("qwen3asr-gpu", "bailian"):
             return ""
         # 路径: <project_root>/config/hotwords.yaml
-        here = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        # pipeline.py 在 <project_root>/sensevoice/pipeline.py，只需两层 dirname
+        # 回到 project_root(曾多套一层 dirname，把路径算到了 work/ 上一级，
+        # 导致 yaml 一直读不到、except 悄悄吞掉 —— 热词注入从未真正生效过)。
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         yaml_path = os.path.join(here, "config", "hotwords.yaml")
         custom = os.environ.get("SENSEVOICE_ASR_CONTEXT_FILE", "").strip()
         if custom:

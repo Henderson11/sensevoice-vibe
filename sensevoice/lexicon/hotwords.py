@@ -73,3 +73,26 @@ def build_context(hotwords_yaml_path: str, max_chars: int = 200) -> str:
     if len(body) > max_chars:
         body = body[:max_chars]
     return body
+
+
+def load_categories(hotwords_yaml_path: str) -> dict[str, list[str]]:
+    """按分类返回原始词条列表,不拼句子、不做 200 字符截断。
+
+    给 qwen-audio-3.0-asr-flash 的 parameters.vocabulary 用 —— 这个字段是
+    结构化的 {词:权重} 字典,不是塞进一段话里让模型"读",不存在"文本太长
+    稀释 LLM 注意力"的顾虑(那是给旧模型 build_context() 自然语言注入设计
+    的顾虑),所以这里不做 200 字符截断,只按分类分组返回,权重由调用方决定。
+    """
+    data = _load_yaml(hotwords_yaml_path)
+    if not data or not isinstance(data, dict):
+        return {}
+    order = ("common_errors", "apis", "projects", "frameworks")
+    result: dict[str, list[str]] = {}
+    for key in order:
+        group = data.get(key)
+        if not isinstance(group, dict):
+            continue
+        terms = [str(t).strip() for t in (group.get("terms") or []) if str(t).strip()]
+        if terms:
+            result[key] = terms
+    return result

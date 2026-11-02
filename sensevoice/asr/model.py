@@ -15,6 +15,7 @@ from funasr.utils.load_utils import extract_fbank, load_audio_text_image_video
 from funasr.utils.postprocess_utils import rich_transcription_postprocess
 
 from sensevoice.asr.confidence import _aggregate_display_conf_scores
+from sensevoice.asr.bailian import BailianASRClient  # 百炼云端 ASR（含对冲/多模型兜底），与 Windows 版共用
 from sensevoice.text.constants import EMOJI_ARTIFACTS
 
 
@@ -32,6 +33,27 @@ def load_model(args: argparse.Namespace):
     if backend == "qwen3asr-gpu":
         return Qwen3ASRGPUClient(
             url=os.environ.get("SENSEVOICE_QWEN3ASR_GPU_URL", "http://localhost:8866"),
+        )
+    if backend == "bailian":
+        custom_yaml = os.environ.get("SENSEVOICE_ASR_CONTEXT_FILE", "").strip()
+        if custom_yaml:
+            hotwords_yaml_path = os.path.expanduser(custom_yaml)
+        else:
+            _project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            hotwords_yaml_path = os.path.join(_project_root, "config", "hotwords.yaml")
+        return BailianASRClient(
+            api_key=os.environ.get("SENSEVOICE_BAILIAN_API_KEY", ""),
+            url=os.environ.get(
+                "SENSEVOICE_BAILIAN_URL",
+                "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+            ),
+            model=os.environ.get("SENSEVOICE_BAILIAN_MODEL", "qwen3-asr-flash"),
+            hotwords_yaml_path=hotwords_yaml_path,
+            # 主模型 hedge_after 内没回，就并发再发给备用模型，谁先成功用谁
+            hedge_models=[m for m in os.environ.get(
+                "SENSEVOICE_BAILIAN_HEDGE_MODELS", "fun-asr-flash-2026-06-15,qwen3-asr-flash").split(",") if m.strip()],
+            hedge_after_sec=float(os.environ.get("SENSEVOICE_BAILIAN_HEDGE_AFTER_MS", "2500")) / 1000.0,
+            timeout_sec=float(os.environ.get("SENSEVOICE_BAILIAN_TIMEOUT_SEC", "15")),
         )
     if backend == "qwen3asr":
         return Qwen3ASREngine(
@@ -239,15 +261,15 @@ def _is_onnx_model(model) -> bool:
 
 
 def _is_qwen3asr(model) -> bool:
-    return isinstance(model, (Qwen3ASREngine, Qwen3ASRGPUClient))
+    return isinstance(model, (Qwen3ASREngine, Qwen3ASRGPUClient, BailianASRClient))
 
 
 def transcribe_array(model, samples: np.ndarray, language: str, context: str = "") -> str:
     if samples.size == 0:
         return ""
     if _is_qwen3asr(model):
-        # 只有 GPU 客户端接受 context;本地 C 引擎接口不一样,context 在那边无效
-        if isinstance(model, Qwen3ASRGPUClient):
+        # 只有支持 context 的 HTTP 客户端才传 context;本地 C 引擎接口不一样,context 在那边无效
+        if isinstance(model, (Qwen3ASRGPUClient, BailianASRClient)):
             return model.transcribe_samples(samples, context=context)
         return model.transcribe_samples(samples)
     if _is_onnx_model(model):
