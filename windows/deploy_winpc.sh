@@ -3,6 +3,7 @@
 #   ./deploy_winpc.sh            # 完整部署（首次会安装私有 Python）
 #   ./deploy_winpc.sh --sync     # 只同步代码+配置（不动 Python/依赖）
 #   ./deploy_winpc.sh --spk      # 同步 + 声纹门禁（torch/funasr/补丁/模型/注册模板）
+#   ./deploy_winpc.sh --deps     # 同步 + 按 requirements.txt 补装依赖（不动 Python、不碰声纹模板）
 #   ... --force                  # 远端文件在上次部署后被直接改过时，仍然覆盖（默认中止）
 set -euo pipefail
 
@@ -13,10 +14,11 @@ REMOTE_DIR_WIN='D:\claudeproject\winvoice'
 REMOTE_DIR_SCP='/D:/claudeproject/winvoice'
 PY_VER="3.12.8"
 SSH_OPTS=(-o ConnectTimeout=20 -o RequestTTY=no -o RemoteCommand=none)
-SYNC_ONLY=0; WITH_SPK=1
+SYNC_ONLY=0; WITH_SPK=1; DEPS=0
 case "${1:-}" in
   --sync) SYNC_ONLY=1; WITH_SPK=0 ;;   # 只同步代码+配置
   --spk)  SYNC_ONLY=1; WITH_SPK=1 ;;   # 同步 + 声纹（依赖/补丁/模型/注册模板）
+  --deps) SYNC_ONLY=1; WITH_SPK=0; DEPS=1 ;;  # 同步 + 补装依赖（完整部署会用 Linux 模板覆盖笔记本上重录的声纹模板）
 esac
 FORCE=0; [[ " $* " == *" --force "* ]] && FORCE=1
 SPK_ENROLL_SRC="${HOME}/.local/state/sensevoice-vibe/speaker_enroll.d"
@@ -121,11 +123,11 @@ for e in "${DEPLOYED[@]}"; do echo "$(sha256sum "${e#*:}" | cut -c1-64) ${e%%:*}
 scp "${SSH_OPTS[@]}" -q "$TMP_MAN" "winpc:$REMOTE_DIR_SCP/.deploy_manifest"
 ps "Get-ChildItem '$REMOTE_DIR_WIN' -File | Select-Object Name,Length | Format-Table -AutoSize | Out-String"
 
-if [[ $SYNC_ONLY -eq 0 ]]; then
+if [[ $SYNC_ONLY -eq 0 || $DEPS -eq 1 ]]; then
   echo "== 6. 安装依赖 =="
   ps "& '$REMOTE_DIR_WIN\\py312\\python.exe' -m pip install --disable-pip-version-check -q -r '$REMOTE_DIR_WIN\\requirements.txt'; 'pip exit: ' + \$LASTEXITCODE"
   echo "== 7. 导入自检 =="
-  ps "& '$REMOTE_DIR_WIN\\py312\\python.exe' -c \"import numpy, requests, yaml, sounddevice, webrtcvad; print('imports ok'); import sounddevice as sd; print('portaudio', sd.get_portaudio_version()[1])\""
+  ps "& '$REMOTE_DIR_WIN\\py312\\python.exe' -c \"import numpy, requests, yaml, sounddevice, webrtcvad, dashscope; print('imports ok, dashscope', dashscope.__version__); import sounddevice as sd; print('portaudio', sd.get_portaudio_version()[1])\""
 fi
 if [[ $WITH_SPK -eq 1 ]]; then
   echo "== 6b. 声纹门禁：依赖（torch CPU + funasr，约 1GB，首次较慢）=="
