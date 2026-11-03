@@ -5,7 +5,8 @@
 
   recent_voice.py           弹 zenity 面板
   recent_voice.py --print   在终端打印同样的列表
-  recent_voice.py --tips    表达复盘：最近的 原话 → 改写 → 表达建议（润色为 pyramid 模式时记录）
+  recent_voice.py --tips    表达复盘：改进重点排序 + 最近的 原话 → 改写 → 表达建议（润色为 pyramid 模式时记录）
+  recent_voice.py --review  同上，弹 zenity 窗口（面板里的"表达复盘"按钮也是它）
 """
 
 import os
@@ -84,22 +85,54 @@ def act_on(row) -> None:
         return
 
 
-def print_tips(limit: int = 10) -> None:
+# 表达建议按问题类型归类，统计出现次数排出"先改哪一条"；按顺序匹配，先命中的为准
+TIP_CATEGORIES = [
+    ("区分事实与猜测", r"而非事实|当成事实|是猜测|是担忧", "把猜测、担忧标明是猜测，别当成结论说"),
+    ("一次只说一件事", r"分开|拆开|一次只|分别", "多个诉求分开说，或先说\"有两件事\"再逐一展开"),
+    ("删去重复绕圈", r"重复|绕圈|啰嗦", "同一个意思只说一次"),
+    ("问题先行", r"^先(问|抛出|说要问)", "提问时第一句就是问题本身，现象和原因放后面"),
+    ("结论先行", r"^先(给结论|说结论|点明|亮出|说明)", "先亮出判断或观点，再给理由"),
+    ("诉求先行", r"^先说(要|核心|明要)", "第一句先说要对方做什么，背景、依据、约束放后面"),
+]
+
+
+def review_text() -> str:
     import json
+    import re
+    from collections import Counter
     path = os.path.join(os.path.dirname(ROOT), "expression_journal.jsonl")
     try:
-        items = [json.loads(l) for l in open(path, encoding="utf-8") if l.strip()][-limit:]
+        items = [json.loads(l) for l in open(path, encoding="utf-8") if l.strip()]
     except FileNotFoundError:
         items = []
     if not items:
-        print("还没有表达建议记录（润色模式为 pyramid 且话足够长时才会记录）")
-    for it in reversed(items):
-        print(f"{it['ts']}  建议：{it['tip']}\n  原话：{it['raw']}\n  改写：{it['polished']}\n")
+        return "还没有表达建议记录（润色模式为 pyramid、且一段话不短于 40 字时才会记录）"
+    counts = Counter()
+    for it in items:
+        cat = next((name for name, rx, _ in TIP_CATEGORIES if re.search(rx, it["tip"])), "其他")
+        counts[cat] += 1
+    advice = {name: tip for name, _, tip in TIP_CATEGORIES}
+    lines = [f"表达复盘：共 {len(items)} 条（{items[0]['ts'][:16]} ~ {items[-1]['ts'][:16]}）", "",
+             "改进重点（按出现次数排序，先改排在前面的）："]
+    for i, (cat, n) in enumerate(counts.most_common(), 1):
+        lines.append(f"  {i}. {cat} ×{n}" + (f" —— {advice[cat]}" if cat in advice else ""))
+    lines += ["", "逐条记录（新的在前）：", ""]
+    for it in reversed(items[-30:]):
+        lines += [f"[{it['ts'][5:16]}] 建议：{it['tip']}", f"  原话：{it['raw']}", f"  改写：{it['polished']}", ""]
+    return "\n".join(lines)
+
+
+def show_review(head: str = "") -> None:
+    subprocess.run(["zenity", "--text-info", "--title=表达复盘", "--width=960", "--height=720", "--font=Monospace 11"],
+                   input=head + review_text(), text=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 def main() -> int:
     if "--tips" in sys.argv:
-        print_tips()
+        print(review_text())
+        return 0
+    if "--review" in sys.argv:
+        show_review()
         return 0
     rs = rows()
     if "--print" in sys.argv:
@@ -108,14 +141,20 @@ def main() -> int:
             print(f"{r['time']:16}{r['dur']:>8}  {r['status']:10}{r['score']:>6}  {r['text']}")
         return 0
     if not rs:
-        notify("还没有最近语音记录")
+        show_review("还没有最近语音记录。\n\n")  # 没有最近语音时直接打开表达复盘
         return 0
-    argv = ["--list", "--title=最近语音（选一条可重试/播放）", "--width=1000", "--height=560",
+    argv = ["--list", "--title=最近语音（选一条可重试/播放）", "--width=1000", "--height=560", "--extra-button=表达复盘",
             "--column=ID", "--column=时间(结束)", "--column=时长", "--column=结果", "--column=声纹", "--column=文字",
             "--hide-column=1", "--print-column=1"]
     for r in rs:
         argv += [r["id"], r["time"], r["dur"], r["status"], r["score"], r["text"] or "—"]
-    picked = zenity(*argv).split("|")[0]
+    res = subprocess.run(["zenity", *argv], capture_output=True, text=True)
+    if "表达复盘" in res.stdout.splitlines():  # zenity 的额外按钮：退出码 1，stdout 是按钮文字
+        show_review()
+        return 0
+    if res.returncode != 0:
+        return 0
+    picked = res.stdout.strip().split("|")[0]
     for r in rs:
         if r["id"] == picked:
             act_on(r)

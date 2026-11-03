@@ -24,10 +24,11 @@
 
 - **云端识别 + 自动兜底**：主模型 `qwen-audio-3.1-asr-flash-message`（带前文上下文）或 `qwen-audio-3.1-asr-flash`；主模型慢了就并发请求备用模型，谁先返回用谁，`./switch_asr.sh` 一键切换
 - **前文上下文**：把最近几句已输入的话传给识别模型，跨句的专有名词、术语更容易认对
+- **边说边发**（Message 版）：开口就预先建好连接；说话过程中某个 5 秒窗的声纹明确像你，才开始把音频实时传上去，服务端边收边识别。说完后识别只需等约 0.05~0.3 秒（整段发送要 1.6~1.9 秒，长段更久），文字和费用不变。旁人的话不会被提前上传
 - **声纹门禁**：本地 ERes2NetV2，说话过程中每 5 秒后台比对一次，说完几乎不用再等；旁人的语音不会上传云端
 - **长口述**：单段最长 3 分钟，快到上限时在短停顿处收尾，不会在词中间截断
 - **LLM 润色**：OpenAI 兼容接口，编程语境下修正同音字、术语、口误和标点；默认 `pyramid` 模式把意识流口述按金字塔原理重组（结论先行、归类分组，问句仍是问句、要求仍是要求，走样时自动退回纠错），较长的话附带一句表达建议；主链路失败自动切备用，熔断保护
-- **表达建议**：每次重组附带一句"原话结构哪里可以改进、下次怎么说"，以不弹横幅的低优先级通知出现，并记入表达日志，`recent_voice.py --tips` 回看 原话 → 改写 → 建议
+- **表达复盘**：每次重组附带一句"原话结构哪里可以改进、下次怎么说"，只在后台记入表达日志、不打扰；有空时按 `Shift+F8` 点"表达复盘"，先看按出现次数排好的改进重点，再逐条看 原话 → 改写 → 建议
 - **项目术语表**：从你的代码目录提取标识符，作为润色时的术语提示
 - **没出字兜底**：可能是你说的、但没出字的语音会自动备份，`Shift+F8` 查看最近语音（时间、时长、结果），可重试、播放、复制，不用再说一遍。提醒按把握分级：确认是你但识别失败才弹通知；声纹被拒的默认静默，只有某一段明确像你（多半是混入了旁人声音）才发一条不弹横幅的低优先级通知
 - **IBus 原生输入**：`commit_text` 直接写入焦点应用，剪贴板和键盘状态不受影响
@@ -42,7 +43,8 @@
                           后台声纹比对（ERes2NetV2）─────▶ 声纹判定 ──✗──▶ 丢弃（接近阈值的存入最近语音，可重试）
                                                                    │✓
                                                                    ▼
-                                         百炼云端识别（主模型 + 并发兜底，带前文与热词）
+                                         百炼云端识别（主模型 + 并发兜底，带前文与热词；
+                                         Message 版说话期间某窗声纹达标即开始实时上传）
                                                                    ▼
                                          LLM 润色（项目术语提示）→ 术语标准化
                                                                    ▼
@@ -78,11 +80,11 @@ tail -f ~/.local/state/sensevoice-vibe/stream_vad.log
 | 操作 | 作用 |
 |---|---|
 | `F8` | 开关收音（daemon 常驻，开关只是暂停/恢复） |
-| `Shift+F8` | 最近语音面板：看最近 20 条的时间、时长、结果，选一条可重新识别并输入 / 播放 / 复制 |
+| `Shift+F8` | 最近语音面板：看最近 20 条的时间、时长、结果，选一条可重新识别并输入 / 播放 / 复制；"表达复盘"按钮打开表达复盘 |
 | 通知里的"重新识别并输入" | 识别失败时弹出；声纹被拒但某段明确像你时进通知列表（不弹横幅）。点一下跳过声纹重新识别，输入到当前光标 |
 | `./switch_asr.sh message\|standard` | 切换 Message 版 / 普通版识别模型并重启 |
 | `./switch_polish.sh pyramid\|faithful` | 切换润色方式：金字塔重组 / 按原话顺序纠错 |
-| `.venv/bin/python recent_voice.py --tips` | 表达复盘：最近的 原话 → 改写 → 表达建议 |
+| `.venv/bin/python recent_voice.py --tips` | 在终端看表达复盘（改进重点排序 + 逐条 原话 → 改写 → 建议） |
 | `./enroll_speaker_f8.sh 名字` | 再录一段声纹模板（如远距离、不同语气），录完自动重启生效 |
 | `./toggle_resident_f8.sh status\|restart` | 查看状态 / 重启 daemon |
 
@@ -94,11 +96,12 @@ tail -f ~/.local/state/sensevoice-vibe/stream_vad.log
 |---|---|---|
 | 识别 | `SENSEVOICE_BAILIAN_MODEL` / `_HEDGE_MODELS` | 主模型与兜底模型；超时和兜底阈值随音频时长自动放大 |
 | 前文 | `SENSEVOICE_BAILIAN_CONTEXT_TURNS` | Message 版带最近几句作前文，0 关闭 |
+| 边说边发 | `SENSEVOICE_ASR_STREAM` / `_WIN_SCORE` | Message 版说话期间开始上传，0 关闭 / 开始上传的单窗声纹门槛（默认 0.60） |
 | 分段 | `SENSEVOICE_STREAM_ENDPOINT_MS` / `_MAX_SEGMENT_MS` | 停顿多久算说完 / 单段上限（默认 1.5s / 3 分钟） |
 | 声纹 | `SENSEVOICE_SPK_THRESHOLD` / `_WINDOW_MS` | 阈值（默认 0.50）/ 分窗长度，0 表示说完再整段判定 |
 | 兜底 | `SENSEVOICE_RECENT_*` | 备份条数、天数、存盘门槛；声纹被拒时提醒的窗口分数（默认 0.60）与冷却时间 |
 | 润色 | `SENSEVOICE_POST_LLM_*` | 接口、模型、模式（`pyramid` / `polish_coding_aggressive`）、重组的最短字数、备用链路、熔断 |
-| 表达建议 | `SENSEVOICE_EXPRESSION_TIPS` / `_TIP_COOLDOWN_SEC` | 是否发建议通知、冷却时间 |
+| 表达建议 | `SENSEVOICE_EXPRESSION_TIPS` | 默认 0：只记日志不通知；1：每条另发低优先级通知 |
 | 术语 | `SENSEVOICE_PROJECT_ROOT` | 提取术语的代码目录 |
 
 **热词表**（可选）：`config/hotwords.yaml`，含个人/项目私有词汇，已加入 `.gitignore`，不会被提交。格式：
@@ -136,7 +139,7 @@ frameworks:
 
 | 位置 | 内容 |
 |---|---|
-| `~/.local/state/sensevoice-vibe/stream_vad.log` | 主日志：分段、声纹（`SPK_WINDOWS` / `SPK_TIME`）、识别（`ASR_USAGE` / `ASR_WIN` / `ASR_FAILED`）、润色、输入 |
+| `~/.local/state/sensevoice-vibe/stream_vad.log` | 主日志：分段、声纹（`SPK_WINDOWS` / `SPK_TIME`）、识别（`ASR_STREAM_BEGIN` / `ASR_TIME` / `ASR_USAGE` / `ASR_WIN` / `ASR_FAILED`）、润色、输入 |
 | `~/.local/state/sensevoice-vibe/post_compare.jsonl` | 逐段记录：识别原文、润色结果、最终输入、丢弃原因 |
 | `~/.local/state/sensevoice-vibe/recent_audio/` | 最近语音备份（`recent_voice.py --print` 在终端查看） |
 
