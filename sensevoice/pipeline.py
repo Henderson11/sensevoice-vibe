@@ -14,6 +14,7 @@ import webrtcvad
 
 from sensevoice.text.processing import compact_log_text, sanitize_transcript_text
 from sensevoice.config.settings import SenseVoiceConfig
+from sensevoice.asr.bailian import MessageStream
 from sensevoice.asr.model import load_asr_client
 from sensevoice.inject.ibus import IBusInjector
 from sensevoice.llm.postprocessor import LLMPostProcessor
@@ -64,6 +65,8 @@ class SenseVoicePipeline:
         self._spk_win_bytes = max(0, int(args.spk_window_ms * args.sample_rate * 2 / 1000))
         self._spk_futs: List[concurrent.futures.Future] = []
         self._spk_win_done = 0
+        # 边说边发（主模型为 *-message 时）：开口就预建连接，任一窗声纹达到门槛才开始上传
+        self._stream: Optional[MessageStream] = None
         # 最近语音备份 + 重试队列（通知按钮 / 控制 socket 的 RETRY 都排进这里，由主循环处理）
         self._retry_q: "queue.Queue[str]" = queue.Queue()
         self._last_spk_notify_ts = 0.0  # 声纹被拒提醒的冷却计时
@@ -181,6 +184,41 @@ class SenseVoicePipeline:
         self.trailing_silence = 0
         self.segment = bytearray()
         self._spk_futs, self._spk_win_done = [], 0
+        self._abort_stream()
+
+    def _open_stream(self) -> None:
+        """开口即在后台建好流式识别连接（不发音频、不计费）；不是 *-message 或已关闭边说边发时为 None。"""
+        self._abort_stream()
+        if self.args.asr_stream and self.model is not None:
+            self._stream = self.model.open_stream(self.args.max_segment_ms / 1000.0)
+
+    def _abort_stream(self) -> None:
+        if self._stream is not None:
+            self._stream.abort()
+            self._stream = None
+
+    def _upload_cleared(self) -> Optional[float]:
+        """说话期间可以开始上传了吗：声纹门禁没开 → 可以；否则要有一窗分数达到门槛（旁人的单窗最高见过 0.56）。
+        返回达标的分数，未达标返回 None。"""
+        if not (self.speaker_gate.requested and self.speaker_gate.enabled):
+            return 1.0
+        for f in self._spk_futs:
+            if f.done() and f.exception() is None and f.result()[0] >= self.args.asr_stream_win_score:
+                return f.result()[0]
+        return None
+
+    def _pump_stream(self, chunk: bytes) -> None:
+        """每来一帧：已在上传就续发；预建会话空等太久就换新的；声纹达标就补发积压并开始上传。"""
+        st = self._stream
+        if st.streaming:
+            st.feed(chunk)
+            return
+        if st.error is None and st.expired():  # 连上了但空等太久；连不上的不重试，说完时照旧整段识别
+            self._open_stream()
+            return
+        win = self._upload_cleared()
+        if win is not None and st.begin(bytes(self.segment), early=True):
+            append_state_log(self.args.state_log, f"ASR_STREAM_BEGIN at_ms={len(self.segment) * 1000 // (self.args.sample_rate * 2)} win={win:.2f}")
 
     def start_capture(self):
         if self.proc is not None:
@@ -352,8 +390,9 @@ class SenseVoicePipeline:
         return ok, score, reason, thr
 
     def _process_finalized_segment(self, samples: np.ndarray, seg_ms: float, retry_entry: Optional[Dict] = None,
-                                   spk_windows=None):
-        """处理已结束的语音段：声纹 → ASR → LLM → 注入。retry_entry 非空 = 用户手动重试一条最近语音，跳过声纹。"""
+                                   spk_windows=None, stream: Optional[MessageStream] = None):
+        """处理已结束的语音段：声纹 → ASR → LLM → 注入。retry_entry 非空 = 用户手动重试一条最近语音，跳过声纹。
+        stream = 这段话的流式识别会话（可能已在说话期间上传完）；声纹不通过时直接丢弃。"""
         assert self.speaker_gate is not None
         assert self.post_llm is not None
         assert self.project_lexicon is not None
@@ -381,6 +420,10 @@ class SenseVoicePipeline:
         compare_rec["spk_thr"] = round(float(spk_thr), 4)
 
         if not spk_ok:
+            if stream is not None:
+                if stream.streaming:  # 说话期间某一窗明确像本人、已上传，但整段没通过：结果丢弃（费用已发生）
+                    append_state_log(args.state_log, "ASR_STREAM_DISCARD reason=spk_reject")
+                stream.abort()
             append_state_log(args.state_log, f"DROP_FINAL_SPK score={spk_score:.3f} thr={spk_thr:.3f} reason={spk_reason}")
             compare_rec["drop_reason"] = f"spk:{spk_reason}"
             if bool(args.compare_log):
@@ -401,7 +444,10 @@ class SenseVoicePipeline:
                 append_state_log(args.state_log, f"SPK_AUTO_ENROLL_SKIP reason={add_info} score={spk_score:.3f} n={self.speaker_gate.enroll_count}")
 
         # 2. 云端 ASR（热词与前文上下文由百炼客户端自己带上）
-        raw_final_text = self.model.transcribe_samples(samples, args.sample_rate)
+        t_asr = time.time()
+        raw_final_text = self.model.transcribe_samples(samples, args.sample_rate, stream=stream)
+        append_state_log(args.state_log, f"ASR_TIME ms={int((time.time() - t_asr) * 1000)} "
+                                         f"stream={self.model.last_stream or 'off'} model={self.model.last_model or '-'}")
         asr_failed = bool(self.model.last_failed)
         if asr_failed:
             self._notify_asr_failed(seg_ms)
@@ -596,6 +642,10 @@ class SenseVoicePipeline:
 
         self.model = load_asr_client()
         self.model.logger = lambda m: append_state_log(args.state_log, m)  # 对冲/报错/失败/用量事件写入状态日志
+        try:
+            self.model.preload()
+        except Exception as e:
+            append_state_log(args.state_log, f"ASR_PRELOAD_ERROR {type(e).__name__}: {e}", level="WARN")
         self.model_ready = True
         append_state_log(args.state_log, "MODEL_READY")
         append_state_log(args.state_log, f"DAEMON_START resident={int(args.resident)} active={int(self.active)}")
@@ -661,6 +711,7 @@ class SenseVoicePipeline:
                             self.trailing_silence = 0
                             self.segment = bytearray(b"".join(self.pre_roll))
                             self._spk_futs, self._spk_win_done = [], 0
+                            self._open_stream()
                             self.inject("SEG", str(self.segment_id))
                             append_state_log(args.state_log, f"SEG id={self.segment_id}")
                             append_state_log(args.state_log, "SPEECH_START")
@@ -673,6 +724,8 @@ class SenseVoicePipeline:
                     win = bytes(self.segment[self._spk_win_done:self._spk_win_done + self._spk_win_bytes])
                     self._spk_win_done += self._spk_win_bytes
                     self._spk_futs.append(self._spk_pool.submit(self._spk_score_window, win))
+                if self._stream is not None:
+                    self._pump_stream(chunk)
                 if is_voiced:
                     self.trailing_silence = 0
                 else:
@@ -688,12 +741,17 @@ class SenseVoicePipeline:
                 elif seg_ms >= self.soft_cut_start_ms:
                     append_state_log(args.state_log, f"SEG_SOFT_CUT seg_ms={int(seg_ms)}")
 
+                stream, self._stream = self._stream, None
                 if seg_ms >= args.min_segment_ms:
+                    if stream is not None:
+                        stream.end()  # 已在上传的先通知服务端收尾，和下面的声纹尾窗计算并行
                     samples = np.frombuffer(self.segment, dtype=np.int16).astype(np.float32) / 32768.0
                     # 尾巴去掉句末判停用的静音帧，否则静音占了尾巴大头、把该窗分数拉低
                     voiced_end = max(self._spk_win_done, len(self.segment) - self.trailing_silence * self.frame_bytes)
                     spk_windows = (self._spk_futs, bytes(self.segment[self._spk_win_done:voiced_end])) if self._spk_futs else None
-                    self._process_finalized_segment(samples, seg_ms, spk_windows=spk_windows)
+                    self._process_finalized_segment(samples, seg_ms, spk_windows=spk_windows, stream=stream)
+                elif stream is not None:
+                    stream.abort()
 
                 append_state_log(args.state_log, "SPEECH_END")
                 self.in_speech = False

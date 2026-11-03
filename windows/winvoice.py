@@ -281,6 +281,11 @@ class Engine:
         self._spk_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="spk")
         self._spk_win_bytes = max(0, env_int("SENSEVOICE_SPK_WINDOW_MS", 5000) * SR * 2 // 1000)
         self._spk_gray = env_float("SENSEVOICE_SPK_WINDOW_GRAY", 0.08)
+        # 边说边发（与 Linux 版同逻辑）：开口即预建连接，任一窗声纹达到门槛才开始上传
+        self._asr_stream_on = os.environ.get("SENSEVOICE_ASR_STREAM", "1") == "1"
+        self._asr_stream_win = env_float("SENSEVOICE_ASR_STREAM_WIN_SCORE", 0.60)
+        self._asr_stream = None
+        threading.Thread(target=self._preload_asr, daemon=True).start()
         self.post = None  # 后台线程构建（含预热探测），好了才参与润色
         # 声纹门禁（复用 Linux 版 verifier.py）。加载要几秒，放后台；加载完之前到来的句子会等它。
         self.spk = None
@@ -293,6 +298,46 @@ class Engine:
         if os.environ.get("SENSEVOICE_POST_LLM_ENABLE", "0") == "1":
             threading.Thread(target=self._init_post, daemon=True).start()
         self._reset_segmenter()
+
+    def _preload_asr(self):
+        try:
+            self.asr.preload()
+        except Exception as e:
+            log(f"ASR_PRELOAD_ERROR {type(e).__name__}: {e}")
+
+    # ---- 边说边发
+    def _open_asr_stream(self):
+        self._abort_asr_stream()
+        if self._asr_stream_on:
+            self._asr_stream = self.asr.open_stream(self.max_segment_ms / 1000.0)
+
+    def _abort_asr_stream(self):
+        if self._asr_stream is not None:
+            self._asr_stream.abort()
+            self._asr_stream = None
+
+    def _upload_cleared(self):
+        """声纹门禁没开 → 可以上传；门禁开了但模型没就绪 → 不上传（fail-closed）；否则要有一窗达到门槛。"""
+        if not self.spk_enabled:
+            return 1.0
+        if self.spk is None:
+            return None
+        for f in self._spk_futs:
+            if f.done() and f.exception() is None and f.result()[0] >= self._asr_stream_win:
+                return f.result()[0]
+        return None
+
+    def _pump_asr_stream(self, frame: bytes):
+        st = self._asr_stream
+        if st.streaming:
+            st.feed(frame)
+            return
+        if st.error is None and st.expired():  # 预建会话空等太久（服务端 ~23s 断开），换一条新的
+            self._open_asr_stream()
+            return
+        win = self._upload_cleared()
+        if win is not None and st.begin(bytes(self.segment), early=True):
+            log(f"ASR_STREAM_BEGIN at_ms={len(self.segment) * 1000 // (SR * 2)} win={win:.2f}")
 
     # ---- 声纹门禁
     def _init_spk(self):
@@ -376,6 +421,7 @@ class Engine:
         self.segment = bytearray()
         self.pre_roll = collections.deque(maxlen=self.pre_roll_frames)
         self._spk_futs, self._spk_win_done = [], 0
+        self._abort_asr_stream()
 
     def _audio_cb(self, indata, frames, t, status):
         if status:
@@ -479,6 +525,7 @@ class Engine:
                 self.segment = bytearray(b"".join(self.pre_roll))
                 self.pre_roll.clear()
                 self.trailing = 0
+                self._open_asr_stream()
                 log("SPEECH_START")
             return
         self.segment.extend(frame)
@@ -487,6 +534,8 @@ class Engine:
             win = bytes(self.segment[self._spk_win_done:self._spk_win_done + self._spk_win_bytes])
             self._spk_win_done += self._spk_win_bytes
             self._spk_futs.append(self._spk_pool.submit(self._spk_score_window, win))
+        if self._asr_stream is not None:
+            self._pump_asr_stream(frame)
         self.trailing = 0 if voiced else self.trailing + 1
         seg_ms = len(self.segment) * 1000 // (SR * 2)
         end_frames = self.soft_cut_frames if seg_ms >= self.soft_cut_start_ms else self.end_frames
@@ -495,9 +544,14 @@ class Engine:
             # 尾巴去掉句末判停用的静音帧
             voiced_end = max(self._spk_win_done, len(self.segment) - self.trailing * FRAME_BYTES)
             spk_windows = (self._spk_futs, bytes(self.segment[self._spk_win_done:voiced_end])) if self._spk_futs else None
+            stream, self._asr_stream = self._asr_stream, None  # 交给处理线程，采集线程不再碰它
             self._reset_segmenter()
             if seg_ms >= self.min_segment_ms:
-                self.pool.submit(self._process, seg, seg_ms, spk_windows)
+                if stream is not None:
+                    stream.end()  # 已在上传的先通知服务端收尾，和声纹尾窗计算并行
+                self.pool.submit(self._process, seg, seg_ms, spk_windows, stream)
+            elif stream is not None:
+                stream.abort()
             if seg_ms >= self.max_segment_ms:
                 log(f"SEG_MAX_CUT seg_ms={seg_ms}")
             elif seg_ms >= self.soft_cut_start_ms:
@@ -536,7 +590,7 @@ class Engine:
         return ok, score, reason, thr
 
     # ---- 一段话的处理：ASR → 润色 → 注入（单线程串行，保证顺序）
-    def _process(self, seg: bytes, seg_ms: int, spk_windows=None):
+    def _process(self, seg: bytes, seg_ms: int, spk_windows=None, stream=None):
         t0 = time.time()
         try:
             samples = np.frombuffer(seg, dtype=np.int16).astype(np.float32) / 32768.0
@@ -545,15 +599,22 @@ class Engine:
                 self.spk_ready.wait(120)
                 if self.spk is None or not self.spk.enabled:
                     log("DROP_SPK_UNAVAILABLE 声纹门禁未就绪，按 fail-closed 丢弃该段")
+                    if stream is not None:
+                        stream.abort()
                     return
                 ok, spk_score, reason, thr = self._verify_speaker(samples, seg_ms, spk_windows)
                 if not ok:
+                    if stream is not None:
+                        if stream.streaming:  # 某一窗明确像本人、已上传，但整段没通过：结果丢弃（费用已发生）
+                            log("ASR_STREAM_DISCARD reason=spk_reject")
+                        stream.abort()
                     log(f"DROP_FINAL_SPK score={spk_score:.3f} thr={thr:.3f} reason={reason} "
                         f"spk_ms={int((time.time()-t0)*1000)}")
                     return
                 log(f"SPK_PASS score={spk_score:.3f} thr={thr:.3f} reason={reason}")
             t_spk = time.time()
-            text = self.asr.transcribe_samples(samples, SR)
+            text = self.asr.transcribe_samples(samples, SR, stream=stream)
+            stream = None  # transcribe_samples 已负责关闭
             t_asr = time.time()
             if not text:
                 if self.asr.last_failed:
@@ -586,11 +647,14 @@ class Engine:
                 self.spk.on_success(spk_score, seg_ms, text)
             log(f"FINAL ok={int(ok)} seg_ms={seg_ms} spk_ms={int((t_spk-t0)*1000)} asr_ms={int((t_asr-t_spk)*1000)} "
                 f"llm_ms={int((t_llm-t_asr)*1000)} polish={polish} inject_ms={int((t_end-t_llm)*1000)} "
-                f"total_ms={int((t_end-t0)*1000)} model={self.asr.last_model}{'(hedged)' if self.asr.last_hedged else ''} text={text}")
+                f"total_ms={int((t_end-t0)*1000)} model={self.asr.last_model}{'(hedged)' if self.asr.last_hedged else ''} "
+                f"stream={self.asr.last_stream or 'off'} text={text}")
             if raw != text:
                 log(f"POLISH_DIFF raw={raw} dst={text}")
         except Exception as e:
             log(f"PROCESS_ERROR {type(e).__name__}: {e}")
+            if stream is not None:
+                stream.abort()
 
     def _inject(self, text: str) -> bool:
         import win_input

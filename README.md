@@ -24,6 +24,7 @@
 
 - **云端识别 + 自动兜底**：主模型 `qwen-audio-3.1-asr-flash-message`（带前文上下文）或 `qwen-audio-3.1-asr-flash`；主模型慢了就并发请求备用模型，谁先返回用谁，`./switch_asr.sh` 一键切换
 - **前文上下文**：把最近几句已输入的话传给识别模型，跨句的专有名词、术语更容易认对
+- **边说边发**（Message 版）：开口就预先建好连接；说话过程中某个 5 秒窗的声纹明确像你，才开始把音频实时传上去，服务端边收边识别。说完后识别只需等约 0.05~0.3 秒（整段发送要 1.6~1.9 秒，长段更久），文字和费用不变。旁人的话不会被提前上传
 - **声纹门禁**：本地 ERes2NetV2，说话过程中每 5 秒后台比对一次，说完几乎不用再等；旁人的语音不会上传云端
 - **长口述**：单段最长 3 分钟，快到上限时在短停顿处收尾，不会在词中间截断
 - **LLM 润色**：OpenAI 兼容接口，编程语境下修正同音字、术语、口误和标点；默认 `pyramid` 模式把意识流口述按金字塔原理重组（结论先行、归类分组，问句仍是问句、要求仍是要求，走样时自动退回纠错），较长的话附带一句表达建议；主链路失败自动切备用，熔断保护
@@ -42,7 +43,8 @@
                           后台声纹比对（ERes2NetV2）─────▶ 声纹判定 ──✗──▶ 丢弃（接近阈值的存入最近语音，可重试）
                                                                    │✓
                                                                    ▼
-                                         百炼云端识别（主模型 + 并发兜底，带前文与热词）
+                                         百炼云端识别（主模型 + 并发兜底，带前文与热词；
+                                         Message 版说话期间某窗声纹达标即开始实时上传）
                                                                    ▼
                                          LLM 润色（项目术语提示）→ 术语标准化
                                                                    ▼
@@ -94,6 +96,7 @@ tail -f ~/.local/state/sensevoice-vibe/stream_vad.log
 |---|---|---|
 | 识别 | `SENSEVOICE_BAILIAN_MODEL` / `_HEDGE_MODELS` | 主模型与兜底模型；超时和兜底阈值随音频时长自动放大 |
 | 前文 | `SENSEVOICE_BAILIAN_CONTEXT_TURNS` | Message 版带最近几句作前文，0 关闭 |
+| 边说边发 | `SENSEVOICE_ASR_STREAM` / `_WIN_SCORE` | Message 版说话期间开始上传，0 关闭 / 开始上传的单窗声纹门槛（默认 0.60） |
 | 分段 | `SENSEVOICE_STREAM_ENDPOINT_MS` / `_MAX_SEGMENT_MS` | 停顿多久算说完 / 单段上限（默认 1.5s / 3 分钟） |
 | 声纹 | `SENSEVOICE_SPK_THRESHOLD` / `_WINDOW_MS` | 阈值（默认 0.50）/ 分窗长度，0 表示说完再整段判定 |
 | 兜底 | `SENSEVOICE_RECENT_*` | 备份条数、天数、存盘门槛；声纹被拒时提醒的窗口分数（默认 0.60）与冷却时间 |
@@ -136,7 +139,7 @@ frameworks:
 
 | 位置 | 内容 |
 |---|---|
-| `~/.local/state/sensevoice-vibe/stream_vad.log` | 主日志：分段、声纹（`SPK_WINDOWS` / `SPK_TIME`）、识别（`ASR_USAGE` / `ASR_WIN` / `ASR_FAILED`）、润色、输入 |
+| `~/.local/state/sensevoice-vibe/stream_vad.log` | 主日志：分段、声纹（`SPK_WINDOWS` / `SPK_TIME`）、识别（`ASR_STREAM_BEGIN` / `ASR_TIME` / `ASR_USAGE` / `ASR_WIN` / `ASR_FAILED`）、润色、输入 |
 | `~/.local/state/sensevoice-vibe/post_compare.jsonl` | 逐段记录：识别原文、润色结果、最终输入、丢弃原因 |
 | `~/.local/state/sensevoice-vibe/recent_audio/` | 最近语音备份（`recent_voice.py --print` 在终端查看） |
 
