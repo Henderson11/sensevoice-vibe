@@ -433,10 +433,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--spk-window-ms", type=int, default=int(os.environ.get("SENSEVOICE_SPK_WINDOW_MS", "5000")))
     p.add_argument("--spk-window-gray", type=float, default=float(os.environ.get("SENSEVOICE_SPK_WINDOW_GRAY", "0.08")),
                    help="Window-mean score within [thr-gray, thr) falls back to whole-segment verification")
-    # 润色 pyramid 模式：不短于此字数才按金字塔原理重组；附带的表达建议记入日志并发低优先级通知（不弹横幅）
+    # 润色 pyramid 模式：不短于此字数才按金字塔原理重组；附带的表达建议记入表达日志
     p.add_argument("--post-llm-pyramid-min-chars", type=int,
                    default=int(os.environ.get("SENSEVOICE_POST_LLM_PYRAMID_MIN_CHARS", "40")))
-    p.add_argument("--expression-tips", type=int, choices=[0, 1], default=int(os.environ.get("SENSEVOICE_EXPRESSION_TIPS", "1")))
+    # 表达建议默认只记日志（Shift+F8 →"表达复盘"查看），不发通知；1=每条再发一条低优先级通知
+    p.add_argument("--expression-tips", type=int, choices=[0, 1], default=int(os.environ.get("SENSEVOICE_EXPRESSION_TIPS", "0")))
     p.add_argument("--expression-tip-cooldown-sec", type=int,
                    default=int(os.environ.get("SENSEVOICE_EXPRESSION_TIP_COOLDOWN_SEC", "300")))
     # 声纹被拒的段默认只静默备份（Shift+F8 可查）。只有"某一窗明确像本人"（混入旁人声音导致整段被拒）才提醒，

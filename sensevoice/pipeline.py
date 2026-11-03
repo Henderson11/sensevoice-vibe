@@ -509,7 +509,7 @@ class SenseVoicePipeline:
                                  [("copy", "复制文字"), ("ignore", "忽略")], text=text)
 
     def _expression_tip(self, raw: str, polished: str, tip: str) -> None:
-        """pyramid 模式的表达建议：记入表达日志（recent_voice.py --tips 复盘），并发低优先级通知（不弹横幅、只进通知列表）。"""
+        """pyramid 模式的表达建议：记入表达日志，有空时在 Shift+F8 →"表达复盘"查看；EXPRESSION_TIPS=1 才另发低优先级通知。"""
         args = self.args
         append_state_log(args.state_log, f"EXPRESSION_TIP {tip}")
         try:
