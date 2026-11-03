@@ -5,6 +5,7 @@
 
   recent_voice.py           弹 zenity 面板
   recent_voice.py --print   在终端打印同样的列表
+  recent_voice.py --tips    表达复盘：最近的 原话 → 改写 → 表达建议（润色为 pyramid 模式时记录）
 """
 
 import os
@@ -83,7 +84,23 @@ def act_on(row) -> None:
         return
 
 
+def print_tips(limit: int = 10) -> None:
+    import json
+    path = os.path.join(os.path.dirname(ROOT), "expression_journal.jsonl")
+    try:
+        items = [json.loads(l) for l in open(path, encoding="utf-8") if l.strip()][-limit:]
+    except FileNotFoundError:
+        items = []
+    if not items:
+        print("还没有表达建议记录（润色模式为 pyramid 且话足够长时才会记录）")
+    for it in reversed(items):
+        print(f"{it['ts']}  建议：{it['tip']}\n  原话：{it['raw']}\n  改写：{it['polished']}\n")
+
+
 def main() -> int:
+    if "--tips" in sys.argv:
+        print_tips()
+        return 0
     rs = rows()
     if "--print" in sys.argv:
         print(f"{'时间':16}{'时长':>8}  {'结果':10}{'声纹':>6}  文字   （录音目录 {ROOT}）")

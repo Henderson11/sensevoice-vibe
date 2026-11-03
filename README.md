@@ -26,7 +26,8 @@
 - **前文上下文**：把最近几句已输入的话传给识别模型，跨句的专有名词、术语更容易认对
 - **声纹门禁**：本地 ERes2NetV2，说话过程中每 5 秒后台比对一次，说完几乎不用再等；旁人的语音不会上传云端
 - **长口述**：单段最长 3 分钟，快到上限时在短停顿处收尾，不会在词中间截断
-- **LLM 润色**：OpenAI 兼容接口，编程语境下修正同音字、术语、口误和标点；主链路失败自动切备用，熔断保护
+- **LLM 润色**：OpenAI 兼容接口，编程语境下修正同音字、术语、口误和标点；默认 `pyramid` 模式把意识流口述按金字塔原理重组（结论先行、归类分组，问句仍是问句、要求仍是要求，走样时自动退回纠错），较长的话附带一句表达建议；主链路失败自动切备用，熔断保护
+- **表达建议**：每次重组附带一句"原话结构哪里可以改进、下次怎么说"，以不弹横幅的低优先级通知出现，并记入表达日志，`recent_voice.py --tips` 回看 原话 → 改写 → 建议
 - **项目术语表**：从你的代码目录提取标识符，作为润色时的术语提示
 - **没出字兜底**：可能是你说的、但没出字的语音会自动备份，`Shift+F8` 查看最近语音（时间、时长、结果），可重试、播放、复制，不用再说一遍。提醒按把握分级：确认是你但识别失败才弹通知；声纹被拒的默认静默，只有某一段明确像你（多半是混入了旁人声音）才发一条不弹横幅的低优先级通知
 - **IBus 原生输入**：`commit_text` 直接写入焦点应用，剪贴板和键盘状态不受影响
@@ -80,6 +81,8 @@ tail -f ~/.local/state/sensevoice-vibe/stream_vad.log
 | `Shift+F8` | 最近语音面板：看最近 20 条的时间、时长、结果，选一条可重新识别并输入 / 播放 / 复制 |
 | 通知里的"重新识别并输入" | 识别失败时弹出；声纹被拒但某段明确像你时进通知列表（不弹横幅）。点一下跳过声纹重新识别，输入到当前光标 |
 | `./switch_asr.sh message\|standard` | 切换 Message 版 / 普通版识别模型并重启 |
+| `./switch_polish.sh pyramid\|faithful` | 切换润色方式：金字塔重组 / 按原话顺序纠错 |
+| `.venv/bin/python recent_voice.py --tips` | 表达复盘：最近的 原话 → 改写 → 表达建议 |
 | `./enroll_speaker_f8.sh 名字` | 再录一段声纹模板（如远距离、不同语气），录完自动重启生效 |
 | `./toggle_resident_f8.sh status\|restart` | 查看状态 / 重启 daemon |
 
@@ -94,7 +97,8 @@ tail -f ~/.local/state/sensevoice-vibe/stream_vad.log
 | 分段 | `SENSEVOICE_STREAM_ENDPOINT_MS` / `_MAX_SEGMENT_MS` | 停顿多久算说完 / 单段上限（默认 1.5s / 3 分钟） |
 | 声纹 | `SENSEVOICE_SPK_THRESHOLD` / `_WINDOW_MS` | 阈值（默认 0.50）/ 分窗长度，0 表示说完再整段判定 |
 | 兜底 | `SENSEVOICE_RECENT_*` | 备份条数、天数、存盘门槛；声纹被拒时提醒的窗口分数（默认 0.60）与冷却时间 |
-| 润色 | `SENSEVOICE_POST_LLM_*` | 接口、模型、模式、备用链路、熔断 |
+| 润色 | `SENSEVOICE_POST_LLM_*` | 接口、模型、模式（`pyramid` / `polish_coding_aggressive`）、重组的最短字数、备用链路、熔断 |
+| 表达建议 | `SENSEVOICE_EXPRESSION_TIPS` / `_TIP_COOLDOWN_SEC` | 是否发建议通知、冷却时间 |
 | 术语 | `SENSEVOICE_PROJECT_ROOT` | 提取术语的代码目录 |
 
 **热词表**（可选）：`config/hotwords.yaml`，含个人/项目私有词汇，已加入 `.gitignore`，不会被提交。格式：
@@ -154,7 +158,8 @@ windows/               WinVoice（Windows 版）与部署脚本
 config/                配置模板、systemd 单元模板、通用编程词表
 install.sh             一键安装        download_models.sh   下载声纹模型
 enroll_speaker_f8.sh   录声纹模板      switch_asr.sh        切换识别模型
-toggle_resident_f8.sh  F8 开关         recent_voice.py      Shift+F8 最近语音面板
+toggle_resident_f8.sh  F8 开关         recent_voice.py      Shift+F8 最近语音面板 / --tips 表达复盘
+switch_polish.sh       切换润色方式
 daemon_launch.sh       systemd 启动入口（加载 llm.env）   retention_housekeep.sh  启动前清理旧日志
 ```
 

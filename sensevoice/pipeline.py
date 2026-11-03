@@ -67,6 +67,7 @@ class SenseVoicePipeline:
         # 最近语音备份 + 重试队列（通知按钮 / 控制 socket 的 RETRY 都排进这里，由主循环处理）
         self._retry_q: "queue.Queue[str]" = queue.Queue()
         self._last_spk_notify_ts = 0.0  # 声纹被拒提醒的冷却计时
+        self._last_tip_notify_ts = 0.0  # 表达建议提醒的冷却计时
         self.recent: Optional[RecentStore] = None
         if args.recent_enable:
             self.recent = RecentStore(os.path.join(self.state_dir, "recent_audio"), max_total=args.recent_max,
@@ -124,6 +125,7 @@ class SenseVoicePipeline:
             min_chars=args.post_llm_min_chars,
             dynamic_max_tokens=bool(args.post_llm_dynamic_max_tokens),
             output_token_factor=args.post_llm_output_token_factor,
+            pyramid_min_chars=args.post_llm_pyramid_min_chars,
         )
         # fallback API 端点（内网网关不可用时降级到官方 API）
         self.post_llm.fallback_url = getattr(args, 'post_llm_fallback_base_url', '') or ''
@@ -430,6 +432,9 @@ class SenseVoicePipeline:
                     final_text = ""
                 else:
                     final_text = revised
+                if self.post_llm.last_tip:
+                    compare_rec["expression_tip"] = self.post_llm.last_tip
+                    self._expression_tip(llm_src, final_text, self.post_llm.last_tip)
             else:
                 compare_rec["llm_action"] = "disabled"
             compare_rec["after_llm"] = final_text
@@ -503,7 +508,22 @@ class SenseVoicePipeline:
             self._notify_actions(eid, f"已识别但没能输入到光标处：{compact_log_text(text)[:40]}",
                                  [("copy", "复制文字"), ("ignore", "忽略")], text=text)
 
-    def _notify_actions(self, eid: str, body: str, actions, text: str = "", urgency: str = "normal") -> None:
+    def _expression_tip(self, raw: str, polished: str, tip: str) -> None:
+        """pyramid 模式的表达建议：记入表达日志（recent_voice.py --tips 复盘），并发低优先级通知（不弹横幅、只进通知列表）。"""
+        args = self.args
+        append_state_log(args.state_log, f"EXPRESSION_TIP {tip}")
+        try:
+            append_jsonl_bounded(os.path.join(self.state_dir, "expression_journal.jsonl"),
+                                 {"ts": time.strftime("%F %T"), "raw": raw, "polished": polished, "tip": tip}, keep_lines=500)
+        except Exception as e:
+            append_state_log(args.state_log, f"EXPRESSION_JOURNAL_ERROR {type(e).__name__}: {e}", level="WARN")
+        now = time.time()
+        if args.expression_tips and now - self._last_tip_notify_ts >= args.expression_tip_cooldown_sec:
+            self._last_tip_notify_ts = now
+            self._notify_actions("", tip, [], urgency="low", title="表达建议")
+
+    def _notify_actions(self, eid: str, body: str, actions, text: str = "", urgency: str = "normal",
+                        title: str = "SenseVoice 没有出字") -> None:
         """弹桌面通知；带按钮时 notify-send -A 会阻塞到用户点击/关闭，所以放后台线程等结果。
         点"重新识别并输入"→ 排进重试队列由主循环处理；点"复制文字"→ wl-copy。"""
         args = self.args
@@ -512,7 +532,7 @@ class SenseVoicePipeline:
             cmd = ["notify-send", "-a", "SenseVoice", "-u", urgency]
             for name, label in actions:
                 cmd += ["-A", f"{name}={label}"]
-            cmd += ["SenseVoice 没有出字", body]
+            cmd += [title, body]
             try:
                 p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
                 try:
