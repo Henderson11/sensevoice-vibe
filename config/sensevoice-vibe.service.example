@@ -7,7 +7,7 @@ StartLimitBurst=5
 
 [Service]
 Type=simple
-# __INSTALL_DIR__ 由 install_autostart_service.sh 替换为实际安装路径
+# 安装路径由 install_autostart_service.sh 自动填入
 WorkingDirectory=__INSTALL_DIR__
 Environment=PYTHONPATH=__INSTALL_DIR__
 # 启动前清理状态目录里的旧日志与旧 wav（不碰声纹模板与 recent_audio）
