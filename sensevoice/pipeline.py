@@ -66,6 +66,7 @@ class SenseVoicePipeline:
         self._spk_win_done = 0
         # 最近语音备份 + 重试队列（通知按钮 / 控制 socket 的 RETRY 都排进这里，由主循环处理）
         self._retry_q: "queue.Queue[str]" = queue.Queue()
+        self._last_spk_notify_ts = 0.0  # 声纹被拒提醒的冷却计时
         self.recent: Optional[RecentStore] = None
         if args.recent_enable:
             self.recent = RecentStore(os.path.join(self.state_dir, "recent_audio"), max_total=args.recent_max,
@@ -383,7 +384,8 @@ class SenseVoicePipeline:
             if bool(args.compare_log):
                 append_jsonl_bounded(args.compare_log_file, compare_rec, keep_lines=args.compare_log_keep_lines)
             if spk_score >= args.recent_spk_min_score:  # 接近阈值：可能是本人（混了旁人声音），留底
-                self._recent_record(samples, seg_ms, "spk_reject", spk_score, "", None)
+                win_max = max(compare_rec.get("spk_windows") or [spk_score])
+                self._recent_record(samples, seg_ms, "spk_reject", spk_score, "", None, win_max=win_max)
             return
 
         # 声纹通过（手动重试不喂给自适应阈值/自动注册）
@@ -464,8 +466,10 @@ class SenseVoicePipeline:
                             compare_rec["final_injected"] or compare_rec["raw_asr"], retry_entry)
 
     def _recent_record(self, samples: np.ndarray, seg_ms: float, status: str, spk_score: float,
-                       text: str, retry_entry: Optional[Dict]) -> None:
-        """把一段语音及其结果记进最近语音备份；没出字的弹带按钮的通知。重试则更新原记录。"""
+                       text: str, retry_entry: Optional[Dict], win_max: float = 0.0) -> None:
+        """把一段语音及其结果记进最近语音备份；重试则更新原记录。
+        通知分两档：已确认是本人但没出字（识别失败/没能输入）→ 正常通知；声纹被拒 → 默认静默，
+        只有某一窗明确像本人（win_max ≥ notify_win_score）才发低优先级通知（不弹横幅），且有冷却。"""
         if self.recent is None:
             return
         args = self.args
@@ -486,21 +490,26 @@ class SenseVoicePipeline:
         if retry_entry is not None:
             if status != "ok":
                 self._notify_actions(eid, f"重试后仍没有出字（{status}），录音还在，可按 Shift+F8 查看", [])
-        elif status == "spk_reject" and seg_ms >= args.recent_notify_min_ms:
-            self._notify_actions(eid, f"{when} 结束的一段 {sec:.0f} 秒语音没通过声纹（{spk_score:.2f}），未输入", retry_btn)
+        elif status == "spk_reject":
+            now = time.time()
+            if (seg_ms >= args.recent_notify_min_ms and win_max >= args.recent_notify_win_score
+                    and now - self._last_spk_notify_ts >= args.recent_notify_cooldown_sec):
+                self._last_spk_notify_ts = now
+                self._notify_actions(eid, f"{when} 结束的一段 {sec:.0f} 秒语音里有像你的声音（{win_max:.2f}），"
+                                          f"但整段没通过声纹（{spk_score:.2f}），未输入", retry_btn, urgency="low")
         elif status == "asr_failed":
             self._notify_actions(eid, f"{when} 结束的一段 {sec:.0f} 秒语音识别失败/超时，未输入", retry_btn)
         elif status == "inject_failed":
             self._notify_actions(eid, f"已识别但没能输入到光标处：{compact_log_text(text)[:40]}",
                                  [("copy", "复制文字"), ("ignore", "忽略")], text=text)
 
-    def _notify_actions(self, eid: str, body: str, actions, text: str = "") -> None:
+    def _notify_actions(self, eid: str, body: str, actions, text: str = "", urgency: str = "normal") -> None:
         """弹桌面通知；带按钮时 notify-send -A 会阻塞到用户点击/关闭，所以放后台线程等结果。
         点"重新识别并输入"→ 排进重试队列由主循环处理；点"复制文字"→ wl-copy。"""
         args = self.args
 
         def run():
-            cmd = ["notify-send", "-a", "SenseVoice"]
+            cmd = ["notify-send", "-a", "SenseVoice", "-u", urgency]
             for name, label in actions:
                 cmd += ["-A", f"{name}={label}"]
             cmd += ["SenseVoice 没有出字", body]

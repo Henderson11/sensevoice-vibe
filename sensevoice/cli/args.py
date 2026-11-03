@@ -433,7 +433,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--spk-window-ms", type=int, default=int(os.environ.get("SENSEVOICE_SPK_WINDOW_MS", "5000")))
     p.add_argument("--spk-window-gray", type=float, default=float(os.environ.get("SENSEVOICE_SPK_WINDOW_GRAY", "0.08")),
                    help="Window-mean score within [thr-gray, thr) falls back to whole-segment verification")
+    # 声纹被拒的段默认只静默备份（Shift+F8 可查）。只有"某一窗明确像本人"（混入旁人声音导致整段被拒）才提醒，
+    # 且用低优先级通知（GNOME 不弹横幅、只进通知列表），冷却期内最多一次
     p.add_argument("--recent-notify-min-ms", type=int,
                    default=int(os.environ.get("SENSEVOICE_RECENT_NOTIFY_MIN_MS", "5000")),
-                   help="Speaker-rejected kept segments at least this long pop a notification with a retry button")
+                   help="Speaker-rejected segments shorter than this never notify")
+    p.add_argument("--recent-notify-win-score", type=float,
+                   default=float(os.environ.get("SENSEVOICE_RECENT_NOTIFY_WIN_SCORE", "0.60")),
+                   help="Notify only if some window scored at least this (clearly the enrolled speaker)")
+    p.add_argument("--recent-notify-cooldown-sec", type=int,
+                   default=int(os.environ.get("SENSEVOICE_RECENT_NOTIFY_COOLDOWN_SEC", "600")))
     return p.parse_args()
