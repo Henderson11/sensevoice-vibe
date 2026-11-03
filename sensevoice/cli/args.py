@@ -4,14 +4,12 @@
 import argparse
 import os
 
+# 声纹模型默认用仓库内 download_models.sh 拉下的 ERes2NetV2
+_DEFAULT_SPK_MODEL = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "models", "eres2netv2")
+
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Continuous auto-VAD realtime transcription")
-    p.add_argument(
-        "--model",
-        default=os.environ.get("SENSEVOICE_MODEL", "iic/SenseVoiceSmall"),
-        help="Model id or local model path",
-    )
     p.add_argument("--device", default=os.environ.get("SENSEVOICE_DEVICE", "cpu"))
     p.add_argument("--language", default=os.environ.get("SENSEVOICE_LANGUAGE", "auto"))
     p.add_argument("--sample-rate", type=int, default=16000)
@@ -61,41 +59,9 @@ def parse_args() -> argparse.Namespace:
         default=int(os.environ.get("SENSEVOICE_STREAM_MIN_SEGMENT_MS", "400")),
     )
     p.add_argument(
-        "--partial-interval-ms",
-        type=int,
-        default=int(os.environ.get("SENSEVOICE_STREAM_PARTIAL_INTERVAL_MS", "350")),
-    )
-    p.add_argument(
-        "--min-partial-ms",
-        type=int,
-        default=int(os.environ.get("SENSEVOICE_STREAM_MIN_PARTIAL_MS", "900")),
-    )
-    p.add_argument(
-        "--auto-enter",
-        action="store_true",
-        default=os.environ.get("SENSEVOICE_AUTO_ENTER", "0") == "1",
-        help="Send FINAL (Enter) when endpoint is detected",
-    )
-    p.add_argument(
-        "--indicator",
-        choices=["none", "notify", "notify_once"],
-        default=os.environ.get("SENSEVOICE_STREAM_INDICATOR", "notify_once"),
-        help="Non-intrusive speaking indicator",
-    )
-    p.add_argument(
         "--input-device",
         default=os.environ.get("SENSEVOICE_ARECORD_DEVICE", ""),
         help="Optional arecord device, e.g. hw:Microphone,0",
-    )
-    p.add_argument(
-        "--inject-mode",
-        default=os.environ.get("SENSEVOICE_INJECT_MODE", "clipboard"),
-        choices=["ibus", "clipboard"],
-        help="Text injection backend: ibus (recommended) or clipboard",
-    )
-    p.add_argument(
-        "--inject-script",
-        default=os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "send_to_focus_ydotool.sh"),
     )
     p.add_argument(
         "--post-llm-fallback-base-url",
@@ -122,19 +88,6 @@ def parse_args() -> argparse.Namespace:
         help="Drop short filler/interjection outputs in Chinese mode",
     )
     p.add_argument(
-        "--partial-strategy",
-        choices=["stable2", "raw"],
-        default=os.environ.get("SENSEVOICE_PARTIAL_STRATEGY", "stable2"),
-        help="stable2: only emit stable prefix agreed by 2 consecutive partial hypotheses",
-    )
-    p.add_argument(
-        "--emit-partial",
-        type=int,
-        choices=[0, 1],
-        default=int(os.environ.get("SENSEVOICE_EMIT_PARTIAL", "1")),
-        help="Whether to emit interim PARTIAL updates",
-    )
-    p.add_argument(
         "--resident",
         action="store_true",
         default=os.environ.get("SENSEVOICE_RESIDENT", "0") == "1",
@@ -145,24 +98,6 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         default=os.environ.get("SENSEVOICE_STREAM_ACTIVE_ON_START", "0") == "1",
         help="Start listening immediately in resident mode",
-    )
-    p.add_argument(
-        "--wake-words",
-        default=os.environ.get("SENSEVOICE_WAKE_WORDS", ""),
-        help="Optional wake words (comma-separated). If set, only matched utterances are injected.",
-    )
-    p.add_argument(
-        "--wake-strategy",
-        choices=["prefix", "contains"],
-        default=os.environ.get("SENSEVOICE_WAKE_STRATEGY", "prefix"),
-        help="Wake word match mode: prefix (recommended) or contains",
-    )
-    p.add_argument(
-        "--wake-strip",
-        type=int,
-        choices=[0, 1],
-        default=int(os.environ.get("SENSEVOICE_WAKE_STRIP", "1")),
-        help="If enabled, strip wake word token from injected text",
     )
     p.add_argument(
         "--speaker-verify",
@@ -197,14 +132,14 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--speaker-model",
-        default=os.environ.get("SENSEVOICE_SPK_MODEL", "campplus"),
+        default=os.environ.get("SENSEVOICE_SPK_MODEL", _DEFAULT_SPK_MODEL),
         help="Speaker verification model id",
     )
     p.add_argument(
         "--speaker-cache-dir",
         default=os.environ.get(
             "SENSEVOICE_SPK_CACHE_DIR",
-            os.path.join(os.path.expanduser("~"), ".cache", "sensevoice-vibe", "spkrec"),
+            _DEFAULT_SPK_MODEL,
         ),
         help="Cache directory for speaker verification model",
     )
@@ -455,28 +390,9 @@ def parse_args() -> argparse.Namespace:
         "--project-lexicon-extra-file",
         default=os.environ.get(
             "SENSEVOICE_PROJECT_LEXICON_EXTRA_FILE",
-            os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "hotwords_coding_zh.txt"),
+            os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "config", "coding_terms_zh.txt"),
         ),
         help="Optional extra lexicon file (one term per line)",
-    )
-    p.add_argument(
-        "--conf-route",
-        type=int,
-        choices=[0, 1],
-        default=int(os.environ.get("SENSEVOICE_CONF_ROUTE_ENABLE", "1")),
-        help="Enable confidence-based routing for post-processing",
-    )
-    p.add_argument(
-        "--conf-high",
-        type=float,
-        default=float(os.environ.get("SENSEVOICE_CONF_ROUTE_HIGH", "0.78")),
-        help="High-confidence threshold (skip heavy post-LLM)",
-    )
-    p.add_argument(
-        "--conf-low",
-        type=float,
-        default=float(os.environ.get("SENSEVOICE_CONF_ROUTE_LOW", "0.52")),
-        help="Low-confidence threshold (stronger post-LLM correction)",
     )
     p.add_argument(
         "--compare-log",
@@ -517,7 +433,20 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--spk-window-ms", type=int, default=int(os.environ.get("SENSEVOICE_SPK_WINDOW_MS", "5000")))
     p.add_argument("--spk-window-gray", type=float, default=float(os.environ.get("SENSEVOICE_SPK_WINDOW_GRAY", "0.08")),
                    help="Window-mean score within [thr-gray, thr) falls back to whole-segment verification")
+    # 润色 pyramid 模式：不短于此字数才按金字塔原理重组；附带的表达建议记入日志并发低优先级通知（不弹横幅）
+    p.add_argument("--post-llm-pyramid-min-chars", type=int,
+                   default=int(os.environ.get("SENSEVOICE_POST_LLM_PYRAMID_MIN_CHARS", "40")))
+    p.add_argument("--expression-tips", type=int, choices=[0, 1], default=int(os.environ.get("SENSEVOICE_EXPRESSION_TIPS", "1")))
+    p.add_argument("--expression-tip-cooldown-sec", type=int,
+                   default=int(os.environ.get("SENSEVOICE_EXPRESSION_TIP_COOLDOWN_SEC", "300")))
+    # 声纹被拒的段默认只静默备份（Shift+F8 可查）。只有"某一窗明确像本人"（混入旁人声音导致整段被拒）才提醒，
+    # 且用低优先级通知（GNOME 不弹横幅、只进通知列表），冷却期内最多一次
     p.add_argument("--recent-notify-min-ms", type=int,
                    default=int(os.environ.get("SENSEVOICE_RECENT_NOTIFY_MIN_MS", "5000")),
-                   help="Speaker-rejected kept segments at least this long pop a notification with a retry button")
+                   help="Speaker-rejected segments shorter than this never notify")
+    p.add_argument("--recent-notify-win-score", type=float,
+                   default=float(os.environ.get("SENSEVOICE_RECENT_NOTIFY_WIN_SCORE", "0.60")),
+                   help="Notify only if some window scored at least this (clearly the enrolled speaker)")
+    p.add_argument("--recent-notify-cooldown-sec", type=int,
+                   default=int(os.environ.get("SENSEVOICE_RECENT_NOTIFY_COOLDOWN_SEC", "600")))
     return p.parse_args()

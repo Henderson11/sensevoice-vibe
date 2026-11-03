@@ -355,6 +355,7 @@ class Engine:
                 min_chars=env_int("SENSEVOICE_POST_LLM_MIN_CHARS", 5),
                 dynamic_max_tokens=g("SENSEVOICE_POST_LLM_DYNAMIC_MAX_TOKENS", "0") == "1",
                 output_token_factor=env_float("SENSEVOICE_POST_LLM_OUTPUT_TOKEN_FACTOR", 0.7),
+                pyramid_min_chars=env_int("SENSEVOICE_POST_LLM_PYRAMID_MIN_CHARS", 40),
             )
             fb = g("SENSEVOICE_POST_LLM_FALLBACK_BASE_URL", "")
             if fb:

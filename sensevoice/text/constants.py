@@ -1,6 +1,5 @@
 # sensevoice/text/constants.py
-# Text processing constants: filler words, punctuation sets, regex patterns,
-# and token classification sets used by sanitization and confidence scoring.
+# 文本常量：语气词/噪声片段（识别结果清洗用）、技术词正则与停用词（项目术语表用）。
 
 import re
 
@@ -35,10 +34,6 @@ SHORT_NOISE_ZH = {
     "我",
 }
 PUNCT_EDGE = " \t\r\n.,，。!?！？、~～:;；'\"\u201c\u201d\u2018\u2019`()[]{}<>+-_/\\|"
-# SenseVoice rich postprocess may emit emotion/event symbols (emoji). Strip them
-# for coding dictation to avoid non-text artifacts in prompts.
-EMOJI_ARTIFACTS = "😊😔😡😰🤢😮🎼👏😀😭🤧❓"
-WAKE_WORD_STRIP_EDGE = " \t\r\n,，。.!?！？、:：;；-—_"
 TECH_TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_./:=+-]{2,}")
 IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{2,}")
 COMMON_TECH_STOPWORDS = {
@@ -73,5 +68,3 @@ COMMON_TECH_STOPWORDS = {
     "double",
     "string",
 }
-CONF_PUNCT_TOKENS = set(".,，。!?！？、:;；()[]{}<>\"'`\u201c\u201d\u2018\u2019")
-CONF_LOW_VALUE_ZH = set("的地得了着过吗么呢啊呀吧嘛将把被与和及并在是有就也都又还才")

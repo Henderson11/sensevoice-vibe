@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from typing import List
 
 
@@ -49,14 +50,6 @@ class SenseVoiceConfig:
                 "segments may never emit"
             )
 
-        # --- Confidence routing ---
-        conf_high = getattr(args, "conf_high", 0.78)
-        conf_low = getattr(args, "conf_low", 0.52)
-        if conf_low >= conf_high:
-            warnings.append(
-                f"CONF_LOW={conf_low} >= CONF_HIGH={conf_high}, routing will be ineffective"
-            )
-
         # --- Speaker adaptive ---
         if getattr(args, "speaker_adaptive", 0):
             floor = getattr(args, "speaker_adaptive_floor", 0.52)
@@ -78,13 +71,10 @@ class SenseVoiceConfig:
     @staticmethod
     def summary(args: argparse.Namespace) -> str:
         """生成配置摘要用于启动日志。"""
-        model_path = str(getattr(args, 'model', '?'))
-        # 只显示最后两级目录
-        model_short = "/".join(model_path.replace("\\", "/").split("/")[-2:]) if "/" in model_path else model_path
-
         lines = ["=== SenseVoice 配置 ==="]
 
-        lines.append(f"  ASR 模型       : {model_short}")
+        lines.append(f"  ASR 模型       : {os.environ.get('SENSEVOICE_BAILIAN_MODEL', 'qwen-audio-3.1-asr-flash')}"
+                     f"（兜底 {os.environ.get('SENSEVOICE_BAILIAN_HEDGE_MODELS', '-')}）")
         lines.append(f"  语言           : {getattr(args, 'language', '?')}")
 
         # 断句参数
@@ -107,13 +97,6 @@ class SenseVoiceConfig:
             lines.append(f"  LLM 润色       : ON  模型={getattr(args, 'post_llm_model', '?')}")
         else:
             lines.append(f"  LLM 润色       : OFF")
-
-        # 置信度路由
-        cr = getattr(args, "conf_route", 0)
-        if cr:
-            lines.append(f"  置信度路由     : ON  高={getattr(args, 'conf_high', '?')} 低={getattr(args, 'conf_low', '?')}")
-        else:
-            lines.append(f"  置信度路由     : OFF")
 
         # 项目术语表
         lex = getattr(args, "project_lexicon", 0)

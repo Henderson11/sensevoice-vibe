@@ -1,26 +1,22 @@
 [Unit]
-Description=SenseVoice Resident VAD Daemon
+Description=SenseVoice Vibe voice input daemon
 After=default.target
-StartLimitIntervalSec=30
-StartLimitBurst=20
+# 5 分钟内最多重启 5 次失败才放弃；启动慢时不至于被熔断
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
-# __INSTALL_DIR__ 由 install_autostart_service.sh 自动替换为实际安装路径
+# 安装路径由 install_autostart_service.sh 自动填入
 WorkingDirectory=__INSTALL_DIR__
-# 所有配置从 llm.env 读取（单一配置源）
-EnvironmentFile=-%h/.config/sensevoice-vibe/llm.env
 Environment=PYTHONPATH=__INSTALL_DIR__
-Environment=SENSEVOICE_RESIDENT=1
-Environment=SENSEVOICE_STREAM_ACTIVE_ON_START=1
-Environment=SENSEVOICE_STATE_LOG=%h/.local/state/sensevoice-vibe/stream_vad.log
-Environment=SENSEVOICE_COMPARE_LOG_FILE=%h/.local/state/sensevoice-vibe/post_compare.jsonl
-Environment=SENSEVOICE_LEARN_STORE=%h/.local/state/sensevoice-vibe/correction_memory.json
+# 启动前清理状态目录里的旧日志与旧 wav（不碰声纹模板与 recent_audio）
 ExecStartPre=/bin/bash __INSTALL_DIR__/retention_housekeep.sh
-ExecStart=__INSTALL_DIR__/.venv/bin/python __INSTALL_DIR__/stream_vad_realtime.py --resident --language auto --indicator none
+# 配置统一在 ~/.config/sensevoice-vibe/llm.env，由 daemon_launch.sh 用 bash source（EnvironmentFile 不展开 $HOME）
+ExecStart=__INSTALL_DIR__/daemon_launch.sh
 Restart=always
-RestartSec=0.8
-TimeoutStopSec=3
+RestartSec=5
+TimeoutStopSec=10
 
 [Install]
 WantedBy=default.target

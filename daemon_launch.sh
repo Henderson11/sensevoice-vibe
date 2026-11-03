@@ -16,5 +16,4 @@ fi
 
 exec "$HERE/.venv/bin/python" "$HERE/stream_vad_realtime.py" \
   --resident \
-  --language "${SENSEVOICE_LANGUAGE:-auto}" \
-  --indicator "${SENSEVOICE_STREAM_INDICATOR:-none}"
+  --language "${SENSEVOICE_LANGUAGE:-auto}"
